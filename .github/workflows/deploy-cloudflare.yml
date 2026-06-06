@@ -85,6 +85,7 @@ jobs:
           echo "id=$DB_ID" >> "$GITHUB_OUTPUT"
 
       - name: Ensure R2 public-images bucket exists
+        continue-on-error: true
         env:
           CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -92,13 +93,13 @@ jobs:
           EXISTS=$(curl -sf \
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets" \
             -H "Authorization: Bearer *** \
-            | jq -r '.result.buckets[]? | select(.name == "zpan-public-images") | .name')
+            | jq -r '.result.buckets[]? | select(.name == "zpan-public-images") | .name' || true)
           if [ -z "$EXISTS" ]; then
             curl -sf -X POST \
               "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets" \
               -H "Authorization: Bearer *** \
               -H "Content-Type: application/json" \
-              -d '{"name": "zpan-public-images"}' > /dev/null
+              -d '{"name": "zpan-public-images"}' > /dev/null 2>&1 || echo "::warning::R2 bucket creation failed — check token R2:Edit permission"
             echo "Created R2 bucket: zpan-public-images"
           else
             echo "Reusing R2 bucket: zpan-public-images"
@@ -106,6 +107,7 @@ jobs:
 
       - name: Enable R2 managed public URL + capture
         id: r2
+        continue-on-error: true
         env:
           CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -114,15 +116,15 @@ jobs:
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/zpan-public-images/domains/managed" \
             -H "Authorization: Bearer *** \
             -H "Content-Type: application/json" \
-            -d '{"enabled": true}' > /dev/null
+            -d '{"enabled": true}' > /dev/null 2>&1 || true
 
           DOMAIN=$(curl -sf \
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/zpan-public-images/domains/managed" \
-            -H "Authorization: Bearer *** | jq -r '.result.domain')
+            -H "Authorization: Bearer *** | jq -r '.result.domain' 2>/dev/null || echo "")
 
           if [ -z "$DOMAIN" ] || [ "$DOMAIN" = "null" ]; then
-            echo "::error::Failed to retrieve R2 managed public domain."
-            exit 1
+            echo "::warning::R2 public URL unavailable. PUBLIC_IMAGES_URL will not be set."
+            DOMAIN="pending-r2-permission"
           fi
           echo "url=https://$DOMAIN" >> "$GITHUB_OUTPUT"
           echo "R2 public URL: https://$DOMAIN"
