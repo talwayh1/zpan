@@ -18,8 +18,11 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
 
-      - name: Check user + orgs
+      - name: Check user + orgs + members
         run: |
-          pnpm exec wrangler d1 execute DB --remote --command "SELECT id, email, role FROM users"
-          pnpm exec wrangler d1 execute DB --remote --command "SELECT id, name, slug FROM organizations"
-          pnpm exec wrangler d1 execute DB --remote --command "SELECT user_id, org_id, role FROM members"
+          echo "=== user ==="
+          pnpm exec wrangler d1 execute DB --remote --command "SELECT id, email, role FROM user"
+          echo "=== organization ==="
+          pnpm exec wrangler d1 execute DB --remote --command "SELECT id, name, slug FROM organization"
+          echo "=== member ==="
+          pnpm exec wrangler d1 execute DB --remote --command "SELECT user_id, org_id, role FROM member"
