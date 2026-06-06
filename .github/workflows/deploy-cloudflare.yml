@@ -92,12 +92,12 @@ jobs:
         run: |
           EXISTS=$(curl -sf \
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets" \
-            -H "Authorization: Bearer *** \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
             | jq -r '.result.buckets[]? | select(.name == "zpan-public-images") | .name' || true)
           if [ -z "$EXISTS" ]; then
             curl -sf -X POST \
               "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets" \
-              -H "Authorization: Bearer *** \
+              -H "Authorization: Bearer $CF_API_TOKEN" \
               -H "Content-Type: application/json" \
               -d '{"name": "zpan-public-images"}' > /dev/null 2>&1 || echo "::warning::R2 bucket creation failed — check token R2:Edit permission"
             echo "Created R2 bucket: zpan-public-images"
@@ -114,13 +114,13 @@ jobs:
         run: |
           curl -sf -X PUT \
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/zpan-public-images/domains/managed" \
-            -H "Authorization: Bearer *** \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
             -H "Content-Type: application/json" \
             -d '{"enabled": true}' > /dev/null 2>&1 || true
 
           DOMAIN=$(curl -sf \
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/zpan-public-images/domains/managed" \
-            -H "Authorization: Bearer *** | jq -r '.result.domain' 2>/dev/null || echo "")
+            -H "Authorization: Bearer $CF_API_TOKEN" | jq -r '.result.domain' 2>/dev/null || echo "")
 
           if [ -z "$DOMAIN" ] || [ "$DOMAIN" = "null" ]; then
             echo "::warning::R2 public URL unavailable. PUBLIC_IMAGES_URL will not be set."
