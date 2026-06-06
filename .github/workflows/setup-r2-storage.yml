@@ -1,0 +1,72 @@
+name: Setup R2 File Storage
+
+# One-time setup: creates R2 bucket + S3 token + registers storage in D1.
+# Run manually from Actions tab.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    env:
+      CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Create R2 file-storage bucket
+        run: |
+          EXISTS=$(curl -sf \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            | jq -r '.result.buckets[]? | select(.name == "zpan-files") | .name' || true)
+          if [ -z "$EXISTS" ]; then
+            curl -sf -X POST \
+              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets" \
+              -H "Authorization: Bearer $CF_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d '{"name":"zpan-files"}'
+            echo "Created bucket: zpan-files"
+          else
+            echo "Reusing bucket: zpan-files"
+          fi
+
+      - name: Create R2 S3 API token
+        id: token
+        run: |
+          RESPONSE=$(curl -sf -X POST \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/api_tokens" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"name":"zpan-rw-token","permissions":["admin_read_write"]}')
+          ACCESS_KEY=$(echo "$RESPONSE" | jq -r '.result.access_key_id')
+          SECRET_KEY=$ "$RESPONSE" | jq -r '.result.secret_access_key')
+          echo "access_key=$ACCESS_KEY" >> "$GITHUB_OUTPUT"
+          echo "secret_key=$SECRET_KEY" >> "$GITHUB_OUTPUT"
+          echo "Token created"
+
+      - name: Register R2 storage in ZPan D1
+        run: |
+          ENDPOINT="https://$CF_ACCOUNT_ID.r2.cloudflarestorage.com"
+          cat > /tmp/r2.sql << 'SQLEOF'
+          INSERT OR IGNORE INTO storages (name, type, endpoint, bucket, access_key, secret_key, mode, created_at, updated_at)
+          VALUES ('Cloudflare R2', 's3', 'ENDPOINT_PLACEHOLDER', 'zpan-files', 'AK_PLACEHOLDER', 'SK_PLACEHOLDER', 'private', datetime('now'), datetime('now'))
+          SQLEOF
+          sed -i "s|ENDPOINT_PLACEHOLDER|$ENDPOINT|" /tmp/r2.sql
+          sed -i "s|AK_PLACEHOLDER|${{ steps.token.outputs.access_key }}|" /tmp/r2.sql
+          sed -i "s|SK_PLACEHOLDER|${{ steps.token.outputs.secret_key }}|" /tmp/r2.sql
+          pnpm exec wrangler d1 execute DB --file /tmp/r2.sql --remote
+          echo "R2 storage registered in ZPan"
+
+      - name: Summary
+        run: |
+          echo "### ✅ R2 File Storage Ready" >> "$GITHUB_STEP_SUMMARY"
+          echo "Bucket: zpan-files" >> "$GITHUB_STEP_SUMMARY"
+          echo "Endpoint: https://$CF_ACCOUNT_ID.r2.cloudflarestorage.com" >> "$GITHUB_STEP_SUMMARY"
