@@ -144,9 +144,7 @@ jobs:
       - name: Patch wrangler.toml with D1 database ID
         run: |
           sed -i "s/database_id = \"[^\"]*\"/database_id = \"${{ steps.d1.outputs.id }}\"/" wrangler.toml
-          # R2 not yet enabled on this account — comment out binding until user activates it.
-          sed -i '/^\[\[r2_buckets\]\]/,/^$/s/^/#/' wrangler.toml
-          echo "R2 binding commented out (activate R2 at dash.cloudflare.com then remove # in wrangler.toml)"
+          echo "R2 activated — binding stays enabled"
 
       - name: Apply D1 migrations
         env:
