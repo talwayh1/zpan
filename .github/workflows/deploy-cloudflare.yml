@@ -144,17 +144,9 @@ jobs:
       - name: Patch wrangler.toml with D1 database ID
         run: |
           sed -i "s/database_id = \"[^\"]*\"/database_id = \"${{ steps.d1.outputs.id }}\"/" wrangler.toml
-          # Check if R2 is enabled on this account. If not, comment out the binding.
-          R2_STATUS=$(curl -sf \
-            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCT/r2/buckets" \
-            -H "Authorization: Bearer *** | jq -r '.success')
-          if [ "$R2_STATUS" != "true" ]; then
-            echo "::notice::R2 not enabled on this account, commenting out R2 binding"
-            sed -i '/^\[\[r2_buckets\]\]/,/^$/s/^/#/' wrangler.toml
-          fi
-        env:
-          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CF_ACCT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # R2 not yet enabled on this account — comment out binding until user activates it.
+          sed -i '/^\[\[r2_buckets\]\]/,/^$/s/^/#/' wrangler.toml
+          echo "R2 binding commented out (activate R2 at dash.cloudflare.com then remove # in wrangler.toml)"
 
       - name: Apply D1 migrations
         env:
