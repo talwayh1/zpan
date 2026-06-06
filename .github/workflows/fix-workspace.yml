@@ -18,11 +18,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
 
-      - name: Check user + orgs + members
+      - name: Check session
         run: |
-          echo "=== user ==="
-          pnpm exec wrangler d1 execute DB --remote --command "SELECT id, email, role FROM user"
-          echo "=== organization ==="
-          pnpm exec wrangler d1 execute DB --remote --command "SELECT id, name, slug FROM organization"
-          echo "=== member ==="
-          pnpm exec wrangler d1 execute DB --remote --command "SELECT user_id, org_id, role FROM member"
+          pnpm exec wrangler d1 execute DB --remote --command \
+            "SELECT id, user_id, active_organization_id, expires_at FROM session LIMIT 3"
