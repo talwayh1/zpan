@@ -9,8 +9,8 @@ jobs:
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
-      R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
+      R2_AK: ${{ secrets.R2_ACCESS_KEY }}
+      R2_SK: ${{ secrets.R2_SECRET_KEY }}
     steps:
       - uses: actions/checkout@v6
       - uses: pnpm/action-setup@v4
@@ -22,13 +22,21 @@ jobs:
 
       - name: Insert R2 storage into D1
         run: |
-          ENDPOINT="https://eb1fb7cd6098540c1c3cb764fea33f8e.r2.cloudflarestorage.com"
+          NOW=** +%s)
           pnpm exec wrangler d1 execute DB --remote --command "
-            INSERT OR IGNORE INTO storages (name, type, endpoint, bucket, access_key, secret_key, mode, created_at, updated_at)
-            VALUES ('Cloudflare R2', 's3', '$ENDPOINT', 'zpan-files', '$R2_ACCESS_KEY', '$R2_SECRET_KEY', 'private', datetime('now'), datetime('now'))
+            INSERT OR IGNORE INTO storages
+              (id, title, mode, bucket, endpoint, region, access_key, secret_key,
+               file_path, custom_host, status, created_at, updated_at,
+               capacity, used, egress_credit_billing_enabled, egress_credit_unit_bytes, egress_credit_per_unit)
+            VALUES
+              ('r2_cloudflare', 'Cloudflare R2', 'private', 'zpan-files',
+               'https://eb1fb7cd6098540c1c3cb764fea33f8e.r2.cloudflarestorage.com',
+               'auto', '$R2_AK', '$R2_SK',
+               '\$UID/\$RAW_NAME', '', 'active', $NOW, $NOW,
+               10737418240, 0, 0, 104857600, 1)
           "
           echo "R2 storage registered!"
 
       - name: Verify
         run: |
-          pnpm exec wrangler d1 execute DB --remote --command "SELECT id, name, type, endpoint, bucket FROM storages"
+          pnpm exec wrangler d1 execute DB --remote --command "SELECT id, title, endpoint, bucket FROM storages"
