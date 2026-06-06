@@ -1,4 +1,4 @@
-name: Create Workspace
+name: Check Quotas
 
 on:
   workflow_dispatch:
@@ -18,7 +18,9 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
 
-      - name: Check session
+      - name: Check quotas
         run: |
-          pnpm exec wrangler d1 execute DB --remote --command \
-            "SELECT id, user_id, active_organization_id, expires_at FROM session LIMIT 3"
+          echo "=== org_quotas ==="
+          pnpm exec wrangler d1 execute DB --remote --command "SELECT * FROM org_quotas"
+          echo "=== system_options ==="
+          pnpm exec wrangler d1 execute DB --remote --command "SELECT key, value FROM system_options WHERE key LIKE '%default%' OR key LIKE '%quota%'"
