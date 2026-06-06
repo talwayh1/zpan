@@ -40,28 +40,28 @@ jobs:
             exit 1
           fi
 
-      - name: Resolve release tag
+      - name: Resolve ref to deploy
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           if [ -n "$INPUT_VERSION" ]; then
-            TAG="$INPUT_VERSION"
+            REF="$INPUT_VERSION"
           else
-            TAG=$(gh api repos/${{ github.repository }}/releases/latest --jq '.tag_name')
+            REF=$(gh api repos/${{ github.repository }}/releases/latest --jq '.tag_name' 2>/dev/null || echo "")
+            if [ -z "$REF" ]; then
+              echo "::notice::No release found, deploying from master"
+              REF="master"
+            fi
           fi
-          if [ -z "$TAG" ]; then
-            echo "::error::No release found"
-            exit 1
-          fi
-          echo "version=$TAG" >> "$GITHUB_OUTPUT"
-          echo "### 🚀 Deploying $TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "### 🚀 Deploying $REF" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/checkout@v6
         with:
           repository: ${{ github.repository }}
-          ref: ${{ steps.release.outputs.version }}
+          ref: ${{ steps.release.outputs.ref }}
 
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v6
