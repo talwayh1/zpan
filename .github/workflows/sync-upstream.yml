@@ -1,0 +1,65 @@
+name: Sync Upstream
+
+# Auto-sync fork with saltbo/zpan upstream daily.
+# On merge conflicts, creates an issue for manual review.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # daily 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    if: github.repository != 'saltbo/zpan'
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/saltbo/zpan.git 2>/dev/null || true
+          git fetch upstream master
+
+          # Try merge
+          if git merge upstream/master --no-edit -m "chore: sync upstream"; then
+            echo "SYNCED=true" >> "$GITHUB_ENV"
+            COUNT=$(git rev-list --count HEAD ^upstream/master || echo 0)
+            echo "Merged upstream/master successfully"
+          else
+            echo "CONFLICT=true" >> "$GITHUB_ENV"
+            echo "Merge conflict detected"
+            git merge --abort
+          fi
+
+      - name: Push
+        if: env.SYNCED == 'true'
+        run: git push origin master
+
+      - name: Create conflict issue
+        if: env.CONFLICT == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🔀 Upstream merge conflict — manual sync needed',
+              body: [
+                'Upstream `saltbo/zpan:master` has changes that conflict with our fork.',
+                '',
+                '```bash',
+                'git fetch upstream master',
+                'git merge upstream/master',
+                '# resolve conflicts, then:',
+                'git push origin master',
+                '```',
+              ].join('\n'),
+              labels: ['upstream'],
+            });
