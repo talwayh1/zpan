@@ -22,19 +22,20 @@ jobs:
 
       - name: Insert R2 storage into D1
         run: |
-          NOW=** +%s)
-          pnpm exec wrangler d1 execute DB --remote --command "
-            INSERT OR IGNORE INTO storages
-              (id, title, mode, bucket, endpoint, region, access_key, secret_key,
-               file_path, custom_host, status, created_at, updated_at,
-               capacity, used, egress_credit_billing_enabled, egress_credit_unit_bytes, egress_credit_per_unit)
+          NOW=$(date +%s)
+          SQL="INSERT OR IGNORE INTO storages
+            (id, title, mode, bucket, endpoint, region, access_key, secret_key,
+             file_path, custom_host, status, created_at, updated_at,
+             capacity, used, egress_credit_billing_enabled, egress_credit_unit_bytes, egress_credit_per_unit)
             VALUES
-              ('r2_cloudflare', 'Cloudflare R2', 'private', 'zpan-files',
-               'https://eb1fb7cd6098540c1c3cb764fea33f8e.r2.cloudflarestorage.com',
-               'auto', '$R2_AK', '$R2_SK',
-               '\$UID/\$RAW_NAME', '', 'active', $NOW, $NOW,
-               10737418240, 0, 0, 104857600, 1)
-          "
+            ('r2_cloudflare', 'Cloudflare R2', 'private', 'zpan-files',
+             'https://eb1fb7cd6098540c1c3cb764fea33f8e.r2.cloudflarestorage.com',
+             'auto', 'AKPLACEHOLDER', 'SKPLACEHOLDER',
+             '\$UID/\$RAW_NAME', '', 'active', $NOW, $NOW,
+             10737418240, 0, 0, 104857600, 1)"
+          SQL=$(echo "$SQL" | sed "s|AKPLACEHOLDER|$R2_AK|g")
+          SQL=$(echo "$SQL" | sed "s|SKPLACEHOLDER|$R2_SK|g")
+          echo "$SQL" | pnpm exec wrangler d1 execute DB --remote --command "$(cat)"
           echo "R2 storage registered!"
 
       - name: Verify
