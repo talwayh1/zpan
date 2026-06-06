@@ -40,14 +40,25 @@ jobs:
 
       - name: Create R2 S3 API token
         id: token
+        continue-on-error: true
         run: |
-          RESPONSE=$(curl -sf -X POST \
+          echo "Attempting to create R2 token via API..."
+          RESPONSE=$(curl -s -X POST \
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/api_tokens" \
-            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Authorization: Bearer *** \
             -H "Content-Type: application/json" \
             -d '{"name":"zpan-rw-token","permissions":["admin_read_write"]}')
+          echo "API Response: $RESPONSE"
+          SUCCESS=$(echo "$RESPONSE" | jq -r '.success')
+          if [ "$SUCCESS" != "true" ]; then
+            echo "::warning::Token creation failed. The CF API token may lack R2 admin permissions."
+            echo "::warning::Create manually at: https://dash.cloudflare.com/$CF_ACCOUNT_ID/r2/api-tokens"
+            echo "access_key=MANUAL_SETUP_NEEDED" >> "$GITHUB_OUTPUT"
+            echo "secret_key=MANUAL_SETUP_NEEDED" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           ACCESS_KEY=$(echo "$RESPONSE" | jq -r '.result.access_key_id')
-          SECRET_KEY=$ "$RESPONSE" | jq -r '.result.secret_access_key')
+          SECRET_KEY=*** "$RESPONSE" | jq -r '.result.secret_access_key')
           echo "access_key=$ACCESS_KEY" >> "$GITHUB_OUTPUT"
           echo "secret_key=$SECRET_KEY" >> "$GITHUB_OUTPUT"
           echo "Token created"
