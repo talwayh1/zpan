@@ -1,0 +1,57 @@
+name: Query R2 Status
+on:
+  workflow_dispatch:
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    env:
+      CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - name: List all R2 buckets
+        run: |
+          echo "=== All R2 Buckets ==="
+          curl -sf "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            | jq -r '.result.buckets[]? | "\(.name) | created: \(.creation_date) | class: \(.storage_class // "standard")"'
+
+      - name: Get zpan-files bucket details
+        run: |
+          echo "=== zpan-files Bucket ==="
+          curl -sf "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/zpan-files" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            | jq '.result'
+
+      - name: Get zpan-public-images bucket details
+        run: |
+          echo "=== zpan-public-images Bucket ==="
+          curl -sf "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/zpan-public-images" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            | jq '.result'
+
+      - name: List zpan-files objects (first 20)
+        run: |
+          echo "=== zpan-files Objects (first 20) ==="
+          curl -sf "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/zpan-files/objects?per_page=20" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            | jq -r '.result.objects[]? | "\(.key) | \(.size) bytes | uploaded: \(.uploaded)"' \
+            || echo "(no objects or error)"
+
+      - name: List zpan-public-images objects (first 20)
+        run: |
+          echo "=== zpan-public-images Objects (first 20) ==="
+          curl -sf "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/zpan-public-images/objects?per_page=20" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            | jq -r '.result.objects[]? | "\(.key) | \(.size) bytes | uploaded: \(.uploaded)"' \
+            || echo "(no objects or error)"
+
+      - name: R2 usage summary
+        run: |
+          echo "=== R2 Usage Summary ==="
+          for BUCKET in zpan-files zpan-public-images; do
+            COUNT=$(curl -sf "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets/$BUCKET/objects?per_page=1000" \
+              -H "Authorization: Bearer $CF_API_TOKEN" \
+              | jq '.result.objects | length' 2>/dev/null || echo "0")
+            echo "$BUCKET: $COUNT objects (sampled first 1000)"
+          done
