@@ -10,13 +10,13 @@ jobs:
       CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
       - name: Create D1 database
+        id: db
         run: |
           RESPONSE=$(curl -sf -X POST \
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/d1/database" \
             -H "Authorization: Bearer *** \
             -H "Content-Type: application/json" \
             -d '{"name":"r2-gallery-db"}')
-          echo "Response: $RESPONSE"
-          DB_ID=$(echo "$RESPONSE" | python3 -c "import sys,json;print(json.load(sys.stdin)['result']['uuid'])")
+          echo "$RESPONSE"
+          DB_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['uuid'])")
           echo "db_id=$DB_ID" >> "$GITHUB_OUTPUT"
-          echo "D1 Database ID: $DB_ID"
