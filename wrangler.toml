@@ -23,7 +23,7 @@ limit = 3600
 period = 60
 
 [vars]
-ZPAN_CACHE_MODE = "distributed"
+ZPAN_CACHE_MODE = "memory"
 
 [[send_email]]
 name = "EMAIL"
