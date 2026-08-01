@@ -2,16 +2,23 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { Resolver } from 'node:dns/promises'
 import { createRequire } from 'node:module'
+import {
+  CloudE2eCommandError,
+  cloudE2eAttemptCount,
+  cloudE2eEndpoints,
+  cloudflaredQuickTunnelArgs,
+  isRetryableQuickTunnelFailure,
+} from './cloud-e2e-resilience.mjs'
 
 const args = process.argv.slice(2)
 const require = createRequire(import.meta.url)
 const runtime = valueAfter('--runtime') ?? process.env.E2E_RUNTIME ?? 'node'
 const project = valueAfter('--project') ?? 'desktop'
-const spec = valueAfter('--spec') ?? 'cloud-store.spec.ts'
+const specs = (valueAfter('--spec') ?? 'cloud-store.spec.ts licensing.spec.ts').split(/\s+/).filter(Boolean)
 const local = args.includes('--local')
 const withS3Mock = args.includes('--with-s3-mock')
 const cloudflared = process.env.CLOUDFLARED_BIN ?? 'cloudflared'
-const appPort = Number(process.env.E2E_APP_PORT ?? (runtime === 'cf' ? 6174 : 6173))
+const appPort = Number(process.env.E2E_APP_PORT ?? 5185)
 const apiPort = Number(process.env.E2E_API_PORT ?? 9222)
 const s3MockPort = Number(process.env.E2E_S3_MOCK_PORT ?? 9191)
 const localBaseUrl = `http://localhost:${appPort}`
@@ -21,54 +28,65 @@ const publicDns = new Resolver()
 publicDns.setServers(['1.1.1.1', '1.0.0.1'])
 
 const cloudEnv = {
-  ZPAN_CLOUD_URL: process.env.ZPAN_CLOUD_URL ?? 'https://zpan-cloud-staging.saltbo.workers.dev',
-  VITE_ZPAN_CLOUD_URL: process.env.VITE_ZPAN_CLOUD_URL ?? 'https://zpan-cloud-staging.saltbo.workers.dev',
+  ZPAN_CLOUD_URL: process.env.ZPAN_CLOUD_URL ?? 'http://localhost:5186',
+  VITE_ZPAN_CLOUD_URL: process.env.VITE_ZPAN_CLOUD_URL ?? 'http://localhost:5186',
 }
+const credentialsEnv = runtimeCloudCredentials(runtime)
 
-const tunnel = local ? null : await startTunnel(localBaseUrl)
-const tunnelHost = tunnel ? new URL(tunnel.url).hostname : ''
-const tunnelIp = tunnel ? await waitForPublicTunnelIp(tunnelHost) : ''
-const baseUrl = tunnel?.url ?? localBaseUrl
-const tunnelEnv = {
-  E2E_BASE_URL: baseUrl,
-  E2E_LOCAL_BASE_URL: localBaseUrl,
-  E2E_APP_PORT: String(appPort),
-  E2E_API_PORT: String(apiPort),
-  BETTER_AUTH_URL: baseUrl,
-  ZPAN_INSTANCE_ID: process.env.ZPAN_INSTANCE_ID ?? `zpan-e2e-${runtime}`,
-  TRUSTED_ORIGINS: `${baseUrl},${localBaseUrl}`,
-  ...(tunnel ? { E2E_CHROME_HOST_RESOLVER_RULES: `MAP ${tunnelHost} ${tunnelIp}` } : {}),
-}
-const e2eEnv = {
-  ...cloudEnv,
-  ...tunnelEnv,
-  ...s3MockEnv(),
-  ...runtimeCloudCredentials(runtime),
-  ...(runtime === 'cf' ? { E2E_RUNTIME: 'cf' } : {}),
-}
+if (runtime === 'cf' && local) rmSync('.wrangler/state/v3/d1', { recursive: true, force: true })
 
-if (runtime === 'cf') {
-  if (local) rmSync('.wrangler/state/v3/d1', { recursive: true, force: true })
-  writeDevVars(e2eEnv)
-  await run('pnpm', ['exec', 'wrangler', 'd1', 'migrations', 'apply', 'DB', '--local'], e2eEnv)
-}
-
-try {
-  await run(process.execPath, [require.resolve('@playwright/test/cli'), 'test', spec, `--project=${project}`], e2eEnv)
-} finally {
-  if (tunnel) {
-    try {
-      tunnel.process.kill()
-    } catch {}
-  }
-  if (existsSync(pidFile)) {
-    const pid = Number(readFileSync(pidFile, 'utf8'))
-    if (Number.isInteger(pid)) {
-      try {
-        process.kill(pid)
-      } catch {}
+const maxRunAttempts = local ? 1 : cloudE2eAttemptCount(process.env.E2E_TUNNEL_RUN_ATTEMPTS)
+for (let attempt = 1; attempt <= maxRunAttempts; attempt += 1) {
+  const tunnel = local ? null : await startTunnel(localBaseUrl)
+  try {
+    const e2eEnv = await buildE2eEnv(tunnel)
+    if (runtime === 'cf') {
+      writeDevVars(e2eEnv)
+      await run('pnpm', ['exec', 'wrangler', 'd1', 'migrations', 'apply', 'DB', '--local'], e2eEnv)
     }
-    rmSync(pidFile, { force: true })
+
+    try {
+      await run(
+        process.execPath,
+        [require.resolve('@playwright/test/cli'), 'test', ...specs, `--project=${project}`],
+        e2eEnv,
+        true,
+      )
+      break
+    } catch (error) {
+      const retryable =
+        error instanceof CloudE2eCommandError &&
+        tunnel &&
+        isRetryableQuickTunnelFailure({
+          commandOutput: error.output,
+          tunnelOutput: tunnel.output(),
+        })
+      if (!retryable || attempt === maxRunAttempts) throw error
+      console.warn(
+        `Quick Tunnel failed during cloud E2E; restarting the tunnel and test harness (${attempt + 1}/${maxRunAttempts})...`,
+      )
+    }
+  } finally {
+    stopTunnel(tunnel)
+  }
+}
+
+async function buildE2eEnv(tunnel) {
+  const tunnelHost = tunnel ? new URL(tunnel.url).hostname : ''
+  if (tunnel) await waitForPublicTunnelIp(tunnelHost)
+  const { browserBaseUrl, publicBaseUrl } = cloudE2eEndpoints(localBaseUrl, tunnel?.url)
+  return {
+    ...cloudEnv,
+    E2E_BASE_URL: browserBaseUrl,
+    E2E_LOCAL_BASE_URL: localBaseUrl,
+    E2E_PUBLIC_BASE_URL: publicBaseUrl,
+    E2E_APP_PORT: String(appPort),
+    E2E_API_PORT: String(apiPort),
+    BETTER_AUTH_URL: publicBaseUrl,
+    TRUSTED_ORIGINS: `${publicBaseUrl},${localBaseUrl}`,
+    ...s3MockEnv(),
+    ...credentialsEnv,
+    ...(runtime === 'cf' ? { E2E_RUNTIME: 'cf' } : {}),
   }
 }
 
@@ -79,17 +97,22 @@ function valueAfter(flag) {
 
 function runtimeCloudCredentials(runtime) {
   const suffix = runtime === 'cf' ? '_CF' : '_NODE'
-  const runtimeEmail = process.env[`E2E_CLOUD_PRO_EMAIL${suffix}`]?.trim()
-  const runtimePassword = process.env[`E2E_CLOUD_PRO_PASSWORD${suffix}`]?.trim()
+  const runtimeEmail =
+    process.env[`E2E_CLOUD_BUSINESS_EMAIL${suffix}`]?.trim() ||
+    process.env[`E2E_CLOUD_PRO_EMAIL${suffix}`]?.trim()
+  const runtimePassword =
+    process.env[`E2E_CLOUD_BUSINESS_PASSWORD${suffix}`]?.trim() ||
+    process.env[`E2E_CLOUD_PRO_PASSWORD${suffix}`]?.trim()
   if (process.env.CI && (!runtimeEmail || !runtimePassword)) {
-    throw new Error(`Missing E2E_CLOUD_PRO_EMAIL${suffix} or E2E_CLOUD_PRO_PASSWORD${suffix}`)
+    throw new Error(`Missing E2E_CLOUD_BUSINESS_EMAIL${suffix} or E2E_CLOUD_BUSINESS_PASSWORD${suffix}`)
   }
-  const email = runtimeEmail || process.env.E2E_CLOUD_PRO_EMAIL
-  const password = runtimePassword || process.env.E2E_CLOUD_PRO_PASSWORD
+  const email = runtimeEmail || process.env.E2E_CLOUD_BUSINESS_EMAIL || process.env.E2E_CLOUD_PRO_EMAIL
+  const password =
+    runtimePassword || process.env.E2E_CLOUD_BUSINESS_PASSWORD || process.env.E2E_CLOUD_PRO_PASSWORD
   return email && password
     ? {
-        E2E_CLOUD_PRO_EMAIL: email,
-        E2E_CLOUD_PRO_PASSWORD: password,
+        E2E_CLOUD_BUSINESS_EMAIL: email,
+        E2E_CLOUD_BUSINESS_PASSWORD: password,
       }
     : {}
 }
@@ -124,7 +147,7 @@ async function startTunnel(target) {
 }
 
 function startTunnelOnce(target) {
-  const child = spawn(cloudflared, ['tunnel', '--url', target, '--no-autoupdate'], {
+  const child = spawn(cloudflared, cloudflaredQuickTunnelArgs(target), {
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   writeFileSync(pidFile, String(child.pid))
@@ -132,6 +155,7 @@ function startTunnelOnce(target) {
   return new Promise((resolve, reject) => {
     let tunnelUrl = null
     let registered = false
+    let output = ''
     const timeout = setTimeout(() => {
       child.kill()
       reject(new Error('Timed out waiting for cloudflared tunnel registration'))
@@ -139,13 +163,14 @@ function startTunnelOnce(target) {
 
     function handleOutput(chunk) {
       const text = chunk.toString()
+      output += text
       process.stdout.write(text)
       const match = text.match(tunnelUrlPattern)
       if (match) tunnelUrl = match[0]
       if (text.includes('Registered tunnel connection')) registered = true
       if (!tunnelUrl || !registered) return
       clearTimeout(timeout)
-      resolve({ process: child, url: tunnelUrl })
+      resolve({ process: child, url: tunnelUrl, output: () => output })
     }
 
     child.stdout.on('data', handleOutput)
@@ -155,6 +180,18 @@ function startTunnelOnce(target) {
       reject(new Error(`cloudflared exited before tunnel URL was available: ${code}`))
     })
   })
+}
+
+function stopTunnel(tunnel) {
+  if (tunnel) tunnel.process.kill()
+  if (!existsSync(pidFile)) return
+  const pid = Number(readFileSync(pidFile, 'utf8'))
+  if (Number.isInteger(pid)) {
+    try {
+      process.kill(pid)
+    } catch {}
+  }
+  rmSync(pidFile, { force: true })
 }
 
 function writeDevVars(env) {
@@ -196,16 +233,26 @@ async function waitForPublicTunnelIp(hostname) {
   throw new Error(`Timed out waiting for public tunnel DNS: ${hostname}`)
 }
 
-function run(command, commandArgs, env = {}) {
+function run(command, commandArgs, env = {}, captureOutput = false) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, commandArgs, {
-      stdio: 'inherit',
+      stdio: captureOutput ? ['inherit', 'pipe', 'pipe'] : 'inherit',
       env: { ...process.env, ...env },
       shell: process.platform === 'win32',
     })
+    let output = ''
+    if (captureOutput) {
+      for (const stream of [child.stdout, child.stderr]) {
+        stream.on('data', (chunk) => {
+          const text = chunk.toString()
+          output += text
+          process.stdout.write(text)
+        })
+      }
+    }
     child.on('exit', (code) => {
       if (code === 0) resolve()
-      else reject(new Error(`${command} ${commandArgs.join(' ')} exited with ${code}`))
+      else reject(new CloudE2eCommandError(command, commandArgs, code, output))
     })
   })
 }

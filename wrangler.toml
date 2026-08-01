@@ -1,12 +1,12 @@
 name = "zpan"
 main = "./workers/bootstrap.ts"
 compatibility_date = "2026-04-12"
-compatibility_flags = ["nodejs_compat"]
+compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
 
 [assets]
 binding = "ASSETS"
 not_found_handling = "single-page-application"
-run_worker_first = ["/api/*", "/dav", "/dav/*", "/r/*", "/s/*"]
+run_worker_first = ["/api", "/api/*", "/.well-known/*", "/dav", "/dav/*", "/ih/*", "/r/*", "/s/*"]
 
 [[d1_databases]]
 binding = "DB"
@@ -14,12 +14,20 @@ database_name = "zpan-db"
 database_id = "fba68591-889a-49ab-9af0-543a30a19e5e"
 migrations_dir = "./migrations"
 
-# Public-bucket for avatars / org logos / future system-level public assets.
-# The deploy workflow provisions this bucket on first run, enables its managed
-# public URL, and writes PUBLIC_IMAGES_URL to the Worker's secret store.
-[[r2_buckets]]
-binding = "PUBLIC_IMAGES"
-bucket_name = "zpan-public-images"
+[[kv_namespaces]]
+binding = "CACHE_KV"
+id = "2721f9d7b47d433d8a0e02171e276f57"
+
+[[ratelimits]]
+name = "WEBDAV_RATE_LIMITER"
+namespace_id = "2801"
+
+[ratelimits.simple]
+limit = 3600
+period = 60
+
+[vars]
+ZPAN_CACHE_MODE = "distributed"
 
 [[send_email]]
 name = "EMAIL"
@@ -34,11 +42,22 @@ max_batch_size = 1
 max_batch_timeout = 1
 max_retries = 3
 
+# Self-hosted avatar storage. When present, avatars upload straight to R2 (served from
+# /api/avatar-blobs, or from PUBLIC_IMAGES_URL if an R2 custom domain is configured)
+# instead of the ZPan Cloud avatar service.
+[[r2_buckets]]
+binding = "PUBLIC_IMAGES"
+bucket_name = "zpan-public-images"
+
 [observability]
 enabled = true
 
+[observability.traces]
+enabled = true
+head_sampling_rate = 0.1
+
 [triggers]
-crons = ["*/10 * * * *", "0 */6 * * *"]
+crons = ["*/10 * * * *", "10 * * * *", "0 */6 * * *", "0 */12 * * *", "0 0 1 * *", "0 4 * * *"]
 
 # ----------------------------------------------------------------------------
 # Staging environment — used by non-production branch builds.
@@ -48,15 +67,35 @@ crons = ["*/10 * * * *", "0 */6 * * *"]
 # ----------------------------------------------------------------------------
 [env.staging]
 
+[env.staging.vars]
+BETTER_AUTH_URL = "https://zpan-staging.saltbo.workers.dev"
+ZPAN_CLOUD_URL = "https://zpan-cloud-staging.saltbo.workers.dev"
+ZPAN_CACHE_MODE = "distributed"
+
 [[env.staging.d1_databases]]
 binding = "DB"
 database_name = "zpan-db-staging"
 database_id = "fba68591-889a-49ab-9af0-543a30a19e5e"
 migrations_dir = "./migrations"
 
+[[env.staging.kv_namespaces]]
+binding = "CACHE_KV"
+id = "7d8625bacbc54e23a46ca4464a9f64a0"
+
+[[env.staging.ratelimits]]
+name = "WEBDAV_RATE_LIMITER"
+namespace_id = "2802"
+
+[env.staging.ratelimits.simple]
+limit = 3600
+period = 60
+
 [[env.staging.r2_buckets]]
 binding = "PUBLIC_IMAGES"
 bucket_name = "zpan-public-images-staging"
+
+[[env.staging.send_email]]
+name = "EMAIL"
 
 [[env.staging.queues.producers]]
 binding = "ARCHIVE_QUEUE"

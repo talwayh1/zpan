@@ -1,5 +1,5 @@
 import type { CommercePayment, CommerceProduct, ProductPrice } from 'zpan-cloud-sdk'
-import type { DirType, ObjectStatus, StorageMode, StorageStatus } from '../constants'
+import type { DirType, ObjectStatus, StorageStatus, StorageStatusReason } from '../constants'
 import type {
   CloudOrder as ZPanCloudOrder,
   CloudOrderFulfillmentPayload as ZPanCloudOrderFulfillmentPayload,
@@ -18,27 +18,35 @@ export interface StorageObject {
   object: string
   storageId: string
   status: ObjectStatus
+  // Soft-delete marker: null = live, epoch ms = in trash.
+  trashedAt: number | null
   createdAt: string
   updatedAt: string
 }
 
+export interface ObjectListItem extends StorageObject {
+  hasChildren: boolean
+}
+
 export interface Storage {
   id: string
-  uid: string
-  title: string
-  mode: StorageMode
+  provider: string
   bucket: string
   endpoint: string
   region: string
   accessKey: string
   secretKey: string
-  customHost: string
+  filePath: string
   capacity: number
+  forcePathStyle: boolean
   egressCreditBillingEnabled: boolean
   egressCreditUnitBytes: number
   egressCreditPerUnit: number
   used: number
+  enabled: boolean
   status: StorageStatus
+  statusReason: StorageStatusReason | null
+  statusCheckedAt: string | null
   createdAt: string
   updatedAt: string
 }
@@ -90,14 +98,6 @@ export interface CurrentStoragePlan {
 }
 
 export type WebhookEventStatus = 'processed' | 'duplicate' | 'failed'
-
-export interface CloudStoreSettings {
-  id: string
-  enabled: boolean
-  status: 'ready' | 'cloud_unbound'
-  createdAt: string
-  updatedAt: string
-}
 
 export type CloudProduct = CommerceProduct
 export type CloudProductPrice = ProductPrice
@@ -182,17 +182,41 @@ export interface SiteInvitation {
   status: SiteInvitationStatus
 }
 
-export interface SystemOption {
-  key: string
-  value: string
-  public: boolean
-}
-
+// Full admin management shape. The public config exposes a separate minimal
+// provider projection from shared/schemas/site-config.ts.
 export interface AuthProvider {
   providerId: string
   type: string
+  enabled: boolean
   name: string
   icon: string
+  clientId: string
+  discoveryUrl: string | null
+  scopes: string[] | null
+  callbackUri: string
+  clientSecret: string
+}
+
+export interface AuthProviderList {
+  items: AuthProvider[]
+  callbackBaseUri: string
+  registeredApplications?: RegisteredOAuthApplication[]
+}
+
+export interface RegisteredOAuthApplication {
+  clientId: string
+  name: string
+  uri: string | null
+  redirectUris: string[]
+  grantTypes: string[]
+  scopes: string[]
+  disabled: boolean
+  createdAt: string
+}
+
+export interface CursorPage<T> {
+  items: T[]
+  nextPageToken: string | null
 }
 
 export interface PaginatedResponse<T> {
@@ -202,80 +226,136 @@ export interface PaginatedResponse<T> {
   pageSize: number
 }
 
-export type DownloaderStatus = 'online' | 'offline' | 'disabled'
-export type DownloaderEngine = 'builtin' | 'aria2' | 'qbittorrent'
+export type {
+  AdminOverview,
+  AdminOverviewDownloader,
+  AdminOverviewStatistics,
+  AdminOverviewStorage,
+  AdminOverviewUserUsage,
+} from './admin-overview'
+export type {
+  AdminDashboardGrowthStats,
+  AdminDashboardOperationsStats,
+  AdminDashboardOverviewStats,
+  AdminDashboardSharingStats,
+  AdminDashboardStorageStats,
+  AdminDashboardTrafficStats,
+  AdminSharingDataQuality,
+  AdminStatsCoverage,
+  AdminStatsDelta,
+  AdminStatsRange,
+  AdminStorageDataQuality,
+  AdminTopShare,
+  AdminTransferDataQuality,
+  AdminUsageBySpace,
+} from './admin-stats'
 
-export interface Downloader {
-  id: string
-  name: string
-  status: DownloaderStatus
-  enabled: boolean
-  version: string
-  hostname: string
-  platform: string
-  arch: string
-  engine: DownloaderEngine
-  capabilities: string[]
-  maxConcurrentTasks: number
-  currentTasks: number
-  downloadBps: number
-  uploadBps: number
-  freeDiskBytes: number
-  remoteDownloadCreditBillingEnabled: boolean
-  remoteDownloadCreditUnitBytes: number
-  remoteDownloadCreditPerUnit: number
-  lastHeartbeatAt: string | null
-  createdBy: string
-  createdAt: string
-  updatedAt: string
-}
+export type DownloaderStatus = 'online' | 'offline' | 'disabled'
+export type DownloaderEngine = 'http' | 'aria2' | 'qbittorrent'
+
+// `Downloader` is inferred from `downloaderSchema` (the wire contract) in
+// shared/schemas/downloads.ts — one source of truth for the OpenAPI document,
+// the generated SDKs, the backend, and the frontend. Do not hand-redeclare it.
+export type { Downloader } from '../schemas/downloads'
 
 export type DownloadSourceType = 'http' | 'magnet' | 'torrent_url'
 export type DownloadTaskStatus =
   | 'queued'
   | 'assigned'
-  | 'running'
-  | 'billing_paused'
+  | 'downloading'
+  | 'suspended'
   | 'pausing'
   | 'paused'
+  | 'interrupted'
   | 'uploading'
   | 'canceling'
   | 'completed'
   | 'failed'
   | 'canceled'
 
-export type DownloadTaskAction = 'pause' | 'resume' | 'cancel' | 'retry' | 'delete'
+export type DownloadTaskAction = 'pause' | 'resume' | 'cancel' | 'retry' | 'restart' | 'delete'
+export type DownloadTaskRuntimePhase = 'metadata' | 'downloading' | 'uploading' | 'seeding' | 'completed' | 'error'
+export type DownloadTaskBillingState = 'none' | 'ok' | 'insufficient_credits'
 
-export interface DownloadTask {
-  id: string
-  orgId: string
-  createdByUserId: string
-  sourceType: DownloadSourceType
-  sourceUri: string
-  name: string | null
-  targetFolder: string
-  category: string | null
-  tags: string[]
-  assignedDownloaderId: string | null
-  status: DownloadTaskStatus
-  downloadedBytes: number
-  storageUploadedBytes: number
-  totalBytes: number | null
-  authorizedBytes: number
-  billedBytes: number
-  billedCredits: number
-  billingStatus: string
-  downloadBps: number
-  storageUploadBps: number
-  errorMessage: string | null
-  resultObjectId: string | null
-  detail: DownloadTaskDetail | null
-  uploadToken?: string
-  createdAt: string
-  updatedAt: string
-  assignedAt: string | null
+// `DownloadTask` is inferred from `downloadTaskSchema` (the wire contract) in
+// shared/schemas/downloads.ts — one source of truth for the OpenAPI document,
+// the generated SDKs, the backend, and the frontend. The sub-interfaces below
+// stay as named building blocks the schema mirrors field-for-field.
+export type {
+  DownloadTask,
+  DownloadTaskEvent,
+  DownloadTaskListItem,
+  DownloadTaskTimeline,
+  DownloadTaskTimelineItem,
+} from '../schemas/downloads'
+
+export interface DownloadTaskSpec {
+  source: {
+    type: DownloadSourceType
+    uri: string
+  }
+  destination: {
+    folder: string
+    name: string | null
+  }
+  labels: {
+    category: string | null
+    tags: string[]
+  }
+}
+
+export interface DownloadTaskExecutionStatus {
+  state: DownloadTaskStatus
+  attempt: number
+  assignment: DownloadTaskAssignment | null
+  progress: DownloadTaskProgress
+  billing: DownloadTaskBilling
+  output: DownloadTaskOutput | null
+  runtime: DownloadTaskRuntime | null
+  error: DownloadTaskError | null
+  resolveStartedAt: string | null
+  resolveCompletedAt: string | null
+  downloadCompletedAt: string | null
+  ingestStartedAt: string | null
+  ingestCompletedAt: string | null
+  seedingStartedAt: string | null
+  seedingStoppedAt: string | null
   startedAt: string | null
   finishedAt: string | null
+  updatedAt: string
+}
+
+export interface DownloadTaskAssignment {
+  downloaderId: string
+  assignedAt?: string | null
+  uploadToken?: string
+}
+
+export interface DownloadTaskTransferProgress {
+  bytes: number
+  totalBytes?: number | null
+  bytesPerSecond: number
+}
+
+export interface DownloadTaskProgress {
+  download: DownloadTaskTransferProgress
+  upload: DownloadTaskTransferProgress
+}
+
+export interface DownloadTaskBilling {
+  state: DownloadTaskBillingState
+  authorizedBytes: number
+  chargedBytes: number
+  chargedCredits: number
+}
+
+export interface DownloadTaskOutput {
+  objectId: string
+}
+
+export interface DownloadTaskError {
+  code?: string | null
+  message: string | null
 }
 
 export interface DownloadTaskTracker {
@@ -293,6 +373,8 @@ export interface DownloadTaskPeer {
   progress?: number
   downloadBps?: number
   uploadBps?: number
+  countryCode?: string
+  regionCode?: string
 }
 
 export interface DownloadTaskFile {
@@ -302,34 +384,105 @@ export interface DownloadTaskFile {
   selected?: boolean
 }
 
-export interface DownloadTaskDetail {
-  engine?: Downloader['engine']
-  phase?: 'metadata' | 'downloading' | 'uploading' | 'seeding' | 'completed' | 'error'
-  engineState?: string
+export interface DownloadTaskRuntime {
+  engine?: DownloaderEngine
+  state?: string
+  phase?: DownloadTaskRuntimePhase
   message?: string
-  etaSeconds?: number | null
+  updatedAt?: string
+  progress?: DownloadTaskProgress
+  torrent?: DownloadTaskTorrentRuntime
+  seeding?: DownloadTaskSeedingRuntime
   connections?: number
+  etaSeconds?: number | null
+  trackers?: DownloadTaskTracker[]
+  peers?: DownloadTaskPeer[]
+  files?: DownloadTaskFile[]
+}
+
+export interface DownloadTaskTorrentRuntime {
   infoHash?: string
-  torrentName?: string
+  name?: string
   seeders?: number
   leechers?: number
   peers?: number
-  peerUploadedBytes?: number
-  peerUploadBps?: number
-  trackers?: DownloadTaskTracker[]
-  peerSamples?: DownloadTaskPeer[]
-  files?: DownloadTaskFile[]
+}
+
+export interface DownloadTaskSeedingRuntime {
+  enabled?: boolean
+  active?: boolean
+  uploadedBytes?: number
+  uploadBytesPerSecond?: number
+  ratio?: number
+  startedAt?: string | null
+  expiresAt?: string | null
 }
 
 export interface ObjectUploadSession {
   id: string
   objectId: string
-  uploadId: string
+  // null for a single-PutObject (≤5 GiB) session; set for S3 multipart.
+  uploadId: string | null
   partSize: number
   status: 'active' | 'completed' | 'aborted'
   expiresAt: string
   createdAt: string
   updatedAt: string
+}
+
+export interface ObjectUploadPartDescriptor {
+  partNumber: number
+  url: string
+  expiresAt: string
+  headers: Record<string, string>
+  offset: number
+  length: number
+}
+
+export interface ObjectUploadWorkflow {
+  version: '1'
+  upload: {
+    method: 'PUT'
+    urlField: 'parts[].url'
+    headersField: 'parts[].headers'
+    fileOffsetField: 'parts[].offset'
+    contentLengthField: 'parts[].length'
+    etagHeader: 'ETag'
+  }
+  complete: {
+    operationId: 'completeObjectUpload'
+    method: 'POST'
+    path: string
+    partsBodyField: 'parts'
+  }
+  rePresign: {
+    operationId: 'presignObjectUploadParts'
+    method: 'POST'
+    path: string
+    partNumbersBodyField: 'partNumbers'
+  }
+  abort: {
+    operationId: 'abortObjectUpload'
+    method: 'DELETE'
+    path: string
+  }
+}
+
+// The upload instructions returned by POST /objects for a file draft: the
+// client PUTs each explicit part descriptor directly to S3, reads the ETag of
+// each response, then POSTs the partNumber+etag records to .../completions.
+export interface ObjectUploadInstructions {
+  sessionId: string
+  uploadId: string | null
+  mode: 'single' | 'multipart'
+  partSize: number
+  partCount: number
+  expiresAt: string
+  presignedExpiresAt: string
+  requiredHeaders: Record<string, string>
+  urls: string[]
+  parts: ObjectUploadPartDescriptor[]
+  workflow: ObjectUploadWorkflow
 }
 
 export type BackgroundJobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'canceled'
@@ -368,6 +521,14 @@ export interface BackgroundJob {
 import type { ShareKind as _ShareKind } from '../schemas/share'
 
 export type { ShareKind } from '../schemas/share'
+export type {
+  StorageUsageBreakdown,
+  StorageUsageCategory,
+  StorageUsageItem,
+  StorageUsageResponse,
+  StorageUsageSortDirection,
+  StorageUsageSortField,
+} from '../storage-usage'
 
 // passwordHash is intentionally not part of the shared wire type; it never leaves the server.
 export interface Share {
@@ -382,6 +543,7 @@ export interface Share {
   views: number
   downloads: number
   status: 'active' | 'revoked'
+  private: boolean
   createdAt: string
 }
 
@@ -402,6 +564,8 @@ export interface ShareMatter {
 export interface ShareListItem extends Share {
   matter: ShareMatter
   recipientCount: number
+  // Present on received shares: display name of the user who shared it.
+  creatorName?: string
 }
 
 export interface ShareView {
@@ -412,6 +576,7 @@ export interface ShareView {
   downloadLimit: number | null
   matter: { name: string; type: string; size: number; isFolder: boolean }
   creatorName: string
+  creatorUsername: string | null
   requiresPassword: boolean
   expired: boolean
   exhausted: boolean
@@ -428,10 +593,12 @@ export interface ShareView {
   recipients?: ShareRecipient[]
 }
 
+export type NotificationType = 'share_received' | 'archive_job_completed' | 'archive_job_failed' | 'team_join'
+
 export interface Notification {
   id: string
   userId: string
-  type: string
+  type: NotificationType
   title: string
   body: string
   refType: string | null
@@ -455,10 +622,23 @@ export interface Announcement {
   updatedAt: string
 }
 
-export interface ActivityEvent {
+export type AuditActorType =
+  | 'user'
+  | 'api_key'
+  | 'agent_oauth'
+  | 'agent'
+  | 'anonymous'
+  | 'system'
+  | 'downloader'
+  | 'task-upload'
+
+export interface AuditEvent {
   id: string
   orgId: string
-  userId: string
+  userId: string | null
+  actorType: AuditActorType
+  actorRef: string | null
+  actorIssuer: string | null
   action: string
   targetType: string
   targetId: string | null
@@ -466,20 +646,25 @@ export interface ActivityEvent {
   metadata: string | null
   createdAt: string
   user: {
-    id: string
+    id: string | null
     name: string
     image: string | null
   }
 }
 
-export interface AdminAuditEvent extends ActivityEvent {
+export interface AdminAuditEvent extends AuditEvent {
   orgName: string | null
 }
 
 export interface ImageHostingConfig {
   orgId: string
   customDomain: string | null
-  cfHostnameId: string | null
+  domainProvider: 'cloudflare_saas' | 'manual' | null
+  providerHostnameId: string | null
+  domainStatus: 'pending_dns' | 'pending_tls' | 'verified' | 'failed' | null
+  domainError: string | null
+  verificationToken: string | null
+  domainLastCheckedAt: string | null
   domainVerifiedAt: string | null
   refererAllowlist: string | null // JSON array of strings; null/empty => allow all
   createdAt: string
@@ -490,10 +675,12 @@ export interface IhostConfigResponse {
   enabled: boolean
   customDomain: string | null
   domainVerifiedAt: number | null
-  domainStatus: 'none' | 'pending' | 'verified'
-  dnsInstructions: { recordType: string; name: string; target: string } | null
+  domainStatus: 'none' | 'pending_dns' | 'pending_tls' | 'verified' | 'failed'
+  domainError: string | null
+  dnsInstructions: Array<{ recordType: 'CNAME' | 'A' | 'AAAA'; name: string; target: string }> | null
+  verificationPath: string | null
   refererAllowlist: string[] | null
-  createdAt: number
+  createdAt: number | null
 }
 
 export type ImageHostingStatus = 'draft' | 'active'
@@ -521,6 +708,7 @@ export interface ImageHosting {
   orgId: string
   token: string
   path: string
+  url: string
   storageId: string
   storageKey: string
   size: number
@@ -533,7 +721,15 @@ export interface ImageHosting {
   createdAt: string
 }
 
-export type { BindingState, LicenseAssertion, ProFeature } from './licensing'
+export type { ChangelogInfo, InstanceInfo } from './instance'
+export type {
+  BindingState,
+  LicenseAssertion,
+  LicenseEdition,
+  LicenseEntitlements,
+  LicenseFeature,
+  ProFeature,
+} from './licensing'
 
 export type BrandingThemePresetId = 'default' | 'ocean' | 'forest' | 'rose'
 

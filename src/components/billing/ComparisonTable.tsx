@@ -12,26 +12,20 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 
 function FeatureCell({
   value,
-  comingSoon,
+  muted,
   t,
 }: {
   value: CellValue
-  comingSoon?: boolean
+  // Render included cells in a muted tone (used for not-yet-shipped features) so a
+  // checkmark doesn't read as "available now" while still showing the target edition.
+  muted?: boolean
   t: (key: string, params?: Record<string, unknown>) => string
 }) {
-  if (comingSoon) {
-    return (
-      <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
-        <Clock className="size-3" />
-        {t('settings.billing.comparison.comingSoon')}
-      </span>
-    )
-  }
   if (typeof value === 'object') {
     return <span className="text-sm text-muted-foreground">{t(value.i18nKey, value.params)}</span>
   }
   return value ? (
-    <Check className="size-4 text-primary" aria-label="Included" />
+    <Check className={muted ? 'size-4 text-muted-foreground' : 'size-4 text-primary'} aria-label="Included" />
   ) : (
     <Minus className="size-4 text-muted-foreground" aria-label="Not included" />
   )
@@ -63,6 +57,7 @@ export function ComparisonTable() {
               <TableHead className="w-28 text-center" style={{ color: '#1A73E8' }}>
                 {t('settings.billing.comparison.pro')}
               </TableHead>
+              <TableHead className="w-28 text-center">{t('settings.billing.comparison.business')}</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -70,31 +65,45 @@ export function ComparisonTable() {
               <>
                 <TableRow key={`cat-${category}`}>
                   <TableCell
-                    colSpan={3}
+                    colSpan={4}
                     className="bg-muted/50 pl-6 font-semibold text-xs uppercase tracking-wide text-muted-foreground"
                   >
                     {t(CATEGORY_I18N[category])}
                   </TableCell>
                 </TableRow>
-                {features.map((feature) => (
-                  <TableRow key={feature.i18nKey}>
-                    <TableCell className="pl-8 font-medium">{t(feature.i18nKey)}</TableCell>
-                    <TableCell className="text-center">
-                      <div className="flex justify-center">
-                        <FeatureCell value={feature.community} t={t} />
-                      </div>
-                    </TableCell>
-                    <TableCell className="text-center">
-                      <div className="flex justify-center">
-                        <FeatureCell
-                          value={feature.pro}
-                          comingSoon={'comingSoon' in feature && feature.comingSoon}
-                          t={t}
-                        />
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                ))}
+                {features.map((feature) => {
+                  const comingSoon = 'comingSoon' in feature && feature.comingSoon
+                  return (
+                    <TableRow key={feature.i18nKey}>
+                      <TableCell className="pl-8 font-medium">
+                        <span className="inline-flex items-center gap-2">
+                          {t(feature.i18nKey)}
+                          {comingSoon && (
+                            <span className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-[10px] font-normal text-muted-foreground">
+                              <Clock className="size-3" />
+                              {t('settings.billing.comparison.comingSoon')}
+                            </span>
+                          )}
+                        </span>
+                      </TableCell>
+                      <TableCell className="text-center">
+                        <div className="flex justify-center">
+                          <FeatureCell value={feature.community} muted={comingSoon} t={t} />
+                        </div>
+                      </TableCell>
+                      <TableCell className="text-center">
+                        <div className="flex justify-center">
+                          <FeatureCell value={feature.pro} muted={comingSoon} t={t} />
+                        </div>
+                      </TableCell>
+                      <TableCell className="text-center">
+                        <div className="flex justify-center">
+                          <FeatureCell value={feature.business} muted={comingSoon} t={t} />
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  )
+                })}
               </>
             ))}
           </TableBody>

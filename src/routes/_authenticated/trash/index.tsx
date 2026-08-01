@@ -1,10 +1,11 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { createFileRoute } from '@tanstack/react-router'
 import { Trash2 } from 'lucide-react'
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { NameConflictDialog } from '@/components/files/dialogs/name-conflict-dialog'
+import { OperationProgress, type OperationProgressState } from '@/components/files/dialogs/operation-progress'
 import { useConflictResolver, withConflictRetry } from '@/components/files/hooks/use-conflict-resolver'
 import { PageHeader } from '@/components/layout/page-header'
 import { TrashList } from '@/components/trash/trash-list'
@@ -18,7 +19,10 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { deleteObject, emptyTrash, listObjects, restoreObject } from '@/lib/api'
+import { useInfiniteScroll } from '@/hooks/useInfiniteScroll'
+import { useServerEventSubscription } from '@/hooks/useServerEvents'
+import { listTrash, purgeTrashObject, restoreObject } from '@/lib/api'
+import { runSequentialOperation } from '@/lib/sequential-operation'
 
 export const Route = createFileRoute('/_authenticated/trash/')({
   component: TrashPage,
@@ -30,25 +34,103 @@ const PAGE_SIZE = 20
 function TrashPage() {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
-  const [page, setPage] = useState(1)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [confirmDialog, setConfirmDialog] = useState<'delete' | 'empty' | null>(null)
   const [pendingDeleteIds, setPendingDeleteIds] = useState<string[]>([])
+  const operationCancelRef = useRef(false)
+  const [operationState, setOperationState] = useState<OperationProgressState | null>(null)
   const conflict = useConflictResolver()
 
-  const trashQuery = useQuery({
-    queryKey: [...QUERY_KEY, page, PAGE_SIZE],
-    queryFn: () => listObjects('', 'trashed', page, PAGE_SIZE),
+  useServerEventSubscription('trash-page', ['matter'], () => {
+    queryClient.invalidateQueries({ queryKey: QUERY_KEY })
   })
+
+  const trashQuery = useInfiniteQuery({
+    queryKey: [...QUERY_KEY, PAGE_SIZE],
+    queryFn: ({ pageParam }) => listTrash({ pageToken: pageParam, pageSize: PAGE_SIZE }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) => lastPage.nextPageToken ?? undefined,
+  })
+  const loadMoreRef = useInfiniteScroll<HTMLDivElement>({
+    hasNextPage: trashQuery.hasNextPage,
+    isFetchingNextPage: trashQuery.isFetchingNextPage,
+    fetchNextPage: trashQuery.fetchNextPage,
+  })
+
+  async function runTrashPageOperation(
+    title: string,
+    ids: string[],
+    runItem: (id: string) => Promise<unknown>,
+  ): Promise<void> {
+    operationCancelRef.current = false
+    const namesById = new Map(items.map((item) => [item.id, item.name]))
+    setOperationState({
+      title,
+      total: ids.length,
+      completed: 0,
+      currentName: '',
+      cancelRequested: false,
+      finished: false,
+      failures: [],
+    })
+
+    const result = await runSequentialOperation({
+      items: ids,
+      shouldCancel: () => operationCancelRef.current,
+      onItemStart: (id) => {
+        setOperationState((state) => (state ? { ...state, currentName: namesById.get(id) ?? id } : state))
+      },
+      onItemComplete: (_id, index) => {
+        setOperationState((state) => (state ? { ...state, completed: index + 1 } : state))
+      },
+      onItemFailure: (id, error, index) => {
+        setOperationState((state) =>
+          state
+            ? {
+                ...state,
+                completed: index + 1,
+                failures: [
+                  ...state.failures,
+                  { name: namesById.get(id) ?? id, message: error.message || t('common.error') },
+                ],
+              }
+            : state,
+        )
+      },
+      runItem,
+    })
+
+    if (result.failed.length > 0) {
+      setOperationState((state) => (state ? { ...state, finished: true, currentName: '' } : state))
+      throw new Error(t('files.operationFailedSummary', { failed: result.failed.length, total: ids.length }))
+    }
+    setOperationState(null)
+    if (result.cancelled) {
+      toast.info(t('files.operationCancelled', { completed: result.completed, total: ids.length }))
+    }
+  }
+
+  function requestOperationCancel() {
+    operationCancelRef.current = true
+    setOperationState((state) => (state ? { ...state, cancelRequested: true } : state))
+  }
+
+  function dismissOperation() {
+    setOperationState(null)
+    setConfirmDialog(null)
+    setPendingDeleteIds([])
+    setSelectedIds(new Set())
+  }
 
   async function runRestore(ids: string[]) {
     conflict.reset()
     const showApplyToAll = ids.length > 1
-    // Each item may collide with a different sibling in its original parent, so
-    // resolve per-id. The sticky "apply to all" lets one decision cover the batch.
-    for (const id of ids) {
-      await withConflictRetry(conflict.prompt, 'file', (strategy) => restoreObject(id, strategy), { showApplyToAll })
-    }
+    await runTrashPageOperation(t('trash.restore'), ids, async (id) => {
+      const restored = await withConflictRetry(conflict.prompt, 'file', (strategy) => restoreObject(id, strategy), {
+        showApplyToAll,
+      })
+      if (!restored) operationCancelRef.current = true
+    })
   }
 
   const restoreMutation = useMutation({
@@ -65,7 +147,7 @@ function TrashPage() {
 
   const deleteMutation = useMutation({
     mutationFn: async (ids: string[]) => {
-      await Promise.all(ids.map((id) => deleteObject(id)))
+      await runTrashPageOperation(t('trash.deletePermanently'), ids, (id) => purgeTrashObject(id))
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: QUERY_KEY })
@@ -81,7 +163,18 @@ function TrashPage() {
   })
 
   const emptyTrashMutation = useMutation({
-    mutationFn: () => emptyTrash(),
+    // Trash lists roots only, so emptying = looping DELETE over every root (each
+    // does the recursive subtree purge backend-side). Paginate to collect them all.
+    mutationFn: async () => {
+      const allIds: string[] = []
+      let pageToken: string | undefined
+      do {
+        const res = await listTrash({ pageToken, pageSize: 100 })
+        allIds.push(...res.items.map((item) => item.id))
+        pageToken = res.nextPageToken ?? undefined
+      } while (pageToken)
+      await runTrashPageOperation(t('trash.empty'), allIds, (id) => purgeTrashObject(id))
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: QUERY_KEY })
       queryClient.invalidateQueries({ queryKey: ['user', 'quota'] })
@@ -94,9 +187,7 @@ function TrashPage() {
     },
   })
 
-  const items = trashQuery.data?.items ?? []
-  const total = trashQuery.data?.total ?? 0
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  const items = trashQuery.data?.pages.flatMap((page) => page.items) ?? []
 
   function handleToggleSelect(id: string) {
     setSelectedIds((prev) => {
@@ -179,38 +270,66 @@ function TrashPage() {
             onDeletePermanently={handleDeleteSingle}
           />
 
-          {totalPages > 1 && (
-            <div className="flex items-center justify-end gap-2">
-              <Button variant="outline" size="sm" disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>
-                {t('trash.prevPage')}
-              </Button>
-              <span className="text-sm text-muted-foreground">{t('trash.pageInfo', { page, total: totalPages })}</span>
-              <Button variant="outline" size="sm" disabled={page >= totalPages} onClick={() => setPage((p) => p + 1)}>
-                {t('trash.nextPage')}
-              </Button>
+          {trashQuery.hasNextPage && (
+            <div ref={loadMoreRef} className="py-3 text-center text-sm text-muted-foreground">
+              {trashQuery.isFetchingNextPage ? t('common.loading') : ''}
             </div>
           )}
         </>
       )}
 
-      <Dialog open={confirmDialog === 'delete'} onOpenChange={(open) => !open && setConfirmDialog(null)}>
+      <Dialog
+        open={confirmDialog === 'delete'}
+        onOpenChange={(open) => {
+          if (!open && operationState) {
+            requestOperationCancel()
+            return
+          }
+          if (!open) setConfirmDialog(null)
+        }}
+      >
         <DialogContent>
           <DialogHeader>
             <DialogTitle>{t('trash.deleteTitle')}</DialogTitle>
-            <DialogDescription>{t('trash.confirmDelete', { count: pendingDeleteIds.length })}</DialogDescription>
+            {!operationState && (
+              <DialogDescription>{t('trash.confirmDelete', { count: pendingDeleteIds.length })}</DialogDescription>
+            )}
           </DialogHeader>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setConfirmDialog(null)}>
-              {t('common.cancel')}
-            </Button>
-            <Button
-              variant="destructive"
-              onClick={() => deleteMutation.mutate(pendingDeleteIds)}
-              disabled={deleteMutation.isPending}
-            >
-              {deleteMutation.isPending ? t('common.loading') : t('trash.deletePermanently')}
-            </Button>
-          </DialogFooter>
+          {operationState ? (
+            <OperationProgress
+              operation={operationState}
+              onCancel={requestOperationCancel}
+              onClose={dismissOperation}
+            />
+          ) : (
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setConfirmDialog(null)}>
+                {t('common.cancel')}
+              </Button>
+              <Button
+                variant="destructive"
+                onClick={() => deleteMutation.mutate(pendingDeleteIds)}
+                disabled={deleteMutation.isPending}
+              >
+                {deleteMutation.isPending ? t('common.loading') : t('trash.deletePermanently')}
+              </Button>
+            </DialogFooter>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!operationState && confirmDialog !== 'delete'}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{operationState?.title}</DialogTitle>
+          </DialogHeader>
+          {operationState && (
+            <OperationProgress
+              operation={operationState}
+              onCancel={requestOperationCancel}
+              onClose={dismissOperation}
+            />
+          )}
         </DialogContent>
       </Dialog>
 

@@ -11,10 +11,6 @@ import { type CloudOrderQuotaChange, legacyCloudProductDeliverableSchema } from 
 
 export { cloudOrderQuotaChangeSchema } from './cloud-store-legacy'
 
-export const cloudStoreSettingsSchema = z.object({
-  enabled: z.boolean(),
-})
-
 export const cloudStoreCurrencySchema = z.literal('usd')
 export const cloudProductPriceSchema = productPriceSchema.extend({
   currency: cloudStoreCurrencySchema,
@@ -183,8 +179,25 @@ export const checkoutInputSchema = z
   .object({
     packageId: z.string().min(1),
     priceId: z.string().min(1).optional(),
+    promotionCode: z.string().trim().min(1).optional(),
   })
   .strict()
+
+export const discountQuoteInputSchema = z
+  .object({
+    code: z.string().trim().min(1).max(64),
+    priceId: z.string().trim().min(1),
+    quantity: z.number().int().positive().optional(),
+  })
+  .strict()
+
+export const discountQuoteSchema = z.object({
+  code: z.string(),
+  currency: z.string(),
+  subtotal: z.number().int(),
+  discount: z.number().int(),
+  total: z.number().int(),
+})
 
 export const giftCardStatusSchema = z.enum(['active', 'redeemed', 'disabled', 'expired', 'revoked'])
 
@@ -199,7 +212,6 @@ export const disableGiftCardSchema = z.object({
   disabled: z.literal(true),
 })
 
-export type CloudStoreSettingsInput = z.infer<typeof cloudStoreSettingsSchema>
 export type CloudStoreCurrency = z.infer<typeof cloudStoreCurrencySchema>
 export type CloudProductPrice = z.infer<typeof cloudProductPriceSchema>
 export type CloudProductDeliverable = z.infer<typeof cloudProductDeliverableSchema>
@@ -209,6 +221,8 @@ export type CloudOrderFulfillmentPayload = z.infer<typeof cloudOrderFulfillmentP
 export type CloudOrderItem = z.infer<typeof cloudOrderItemSchema>
 export type CloudOrder = z.infer<typeof cloudOrderSchema>
 export type CheckoutInput = z.infer<typeof checkoutInputSchema>
+export type DiscountQuoteInput = z.infer<typeof discountQuoteInputSchema>
+export type DiscountQuote = z.infer<typeof discountQuoteSchema>
 export type GiftCardStatus = z.infer<typeof giftCardStatusSchema>
 export type CreateGiftCardInput = z.input<typeof createGiftCardInputSchema>
 export type DisableGiftCardInput = z.infer<typeof disableGiftCardSchema>

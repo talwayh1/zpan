@@ -1,6 +1,6 @@
 import { DirType } from '@shared/constants'
 import type { StorageObject } from '@shared/types'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
 import {
   getCoreRowModel,
@@ -23,10 +23,13 @@ import { Card } from '@/components/ui/card'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { UploadDropzone, type UploadDropzoneHandle } from '@/components/upload/upload-dropzone'
 import type { UploadRunnerContext } from '@/components/upload/upload-queue'
-import { createBackgroundJob, getObject, listObjectsByPath } from '@/lib/api'
+import { useInfiniteScroll } from '@/hooks/useInfiniteScroll'
+import { useServerEventSubscription } from '@/hooks/useServerEvents'
+import { createBackgroundJob, deleteObject, getObject, listObjectsByPath, updateObject } from '@/lib/api'
+import { runSequentialOperation } from '@/lib/sequential-operation'
 import { cn } from '@/lib/utils'
 import { getColumns } from './columns'
-import { NameConflictDialog } from './dialogs/name-conflict-dialog'
+import type { OperationProgressState } from './dialogs/operation-progress'
 import { DndWrapper } from './dnd-wrapper'
 import { FileManagerDialogs } from './file-manager-dialogs'
 import { FilesGrid } from './files-grid'
@@ -35,9 +38,10 @@ import { FilesToolbar } from './files-toolbar'
 import { useConflictResolver, withConflictRetry } from './hooks/use-conflict-resolver'
 import { useFileMutations } from './hooks/use-file-mutations'
 import { useViewMode } from './hooks/use-view-mode'
+import { TransferSpaceDialog } from './transfer-space-dialog'
 import type { BreadcrumbItem, FileActionHandlers } from './types'
 
-const FILES_PAGE_SIZE = 500
+const FILES_PAGE_SIZE = 100
 
 export interface FileManagerHeaderMeta {
   label: string
@@ -112,7 +116,11 @@ interface FileManagerProps {
   onNavigatePath?: (path: string) => void
   dataSource?: {
     queryKeyPrefix: readonly unknown[]
-    list: (path: string, opts: { filterType?: string; search?: string }) => Promise<{ items: StorageObject[] }>
+    resourceTypes: string[]
+    list: (
+      path: string,
+      opts: { filterType?: string; search?: string; pageToken?: string },
+    ) => Promise<{ items: StorageObject[]; nextPageToken: string | null }>
     getPreviewFile?: (item: StorageObject) => Promise<PreviewFile | null>
     download?: (item: StorageObject) => Promise<void> | void
     upload?: (file: File, ctx: UploadRunnerContext) => Promise<void>
@@ -125,6 +133,7 @@ interface FileManagerProps {
     rename?: boolean
     copy?: boolean
     move?: boolean
+    transfer?: boolean
     trash?: boolean
     share?: boolean
     copyUrl?: boolean
@@ -163,6 +172,10 @@ export function FileManager({
   const dropzoneRef = useRef<UploadDropzoneHandle>(null)
 
   const currentPath = initialPath ?? ''
+  const resourceTypes = dataSource?.resourceTypes ?? ['matter']
+  useServerEventSubscription('file-manager', resourceTypes, () => {
+    void queryClient.invalidateQueries({ queryKey: dataSource?.queryKeyPrefix ?? ['objects'] })
+  })
   const breadcrumb = pathToBreadcrumb(currentPath, rootName ?? t('files.title'))
   const resolvedCapabilities = useMemo(
     () => ({
@@ -173,6 +186,7 @@ export function FileManager({
       rename: capabilities?.rename ?? !dataSource,
       copy: capabilities?.copy ?? !dataSource,
       move: capabilities?.move ?? !dataSource,
+      transfer: capabilities?.transfer ?? !dataSource,
       trash: capabilities?.trash ?? !dataSource,
       share: capabilities?.share ?? !dataSource,
       copyUrl: capabilities?.copyUrl ?? false,
@@ -206,23 +220,33 @@ export function FileManager({
   const [moveTargetIds, setMoveTargetIds] = useState<string[]>([])
   const [showNewFolder, setShowNewFolder] = useState(false)
   const [shareTarget, setShareTarget] = useState<StorageObject | null>(null)
+  const [transferTarget, setTransferTarget] = useState<StorageObject | null>(null)
   const [previewFile, setPreviewFile] = useState<PreviewFile | null>(null)
   const [previewOpen, setPreviewOpen] = useState(false)
   const [uploadMenuOpen, setUploadMenuOpen] = useState(false)
   const uploadMenuCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const musicPlayer = useMusicPlayer()
 
-  const query = useQuery({
+  const query = useInfiniteQuery({
     queryKey: [...(dataSource?.queryKeyPrefix ?? ['objects', 'active', 'path']), currentPath, filterType ?? ''],
-    queryFn: () =>
-      dataSource?.list(currentPath, { filterType }) ??
-      listObjectsByPath(currentPath, 'active', 1, FILES_PAGE_SIZE, {
+    queryFn: ({ pageParam }) =>
+      dataSource?.list(currentPath, { filterType, pageToken: pageParam }) ??
+      listObjectsByPath(currentPath, pageParam, FILES_PAGE_SIZE, {
         type: filterType,
       }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) => lastPage.nextPageToken ?? undefined,
   })
   const mutations = useFileMutations(currentPath)
   const conflict = useConflictResolver()
-  const items = query.data?.items ?? []
+  const items = useMemo(() => query.data?.pages.flatMap((page) => page.items) ?? [], [query.data?.pages])
+  const loadMoreRef = useInfiniteScroll<HTMLDivElement>({
+    hasNextPage: query.hasNextPage,
+    isFetchingNextPage: query.isFetchingNextPage,
+    fetchNextPage: query.fetchNextPage,
+  })
+  const operationCancelRef = useRef(false)
+  const [operationState, setOperationState] = useState<OperationProgressState | null>(null)
   const archiveMutation = useMutation({
     mutationFn: (
       input: { type: 'archive_compress'; matterIds: string[] } | { type: 'archive_extract'; matterId: string },
@@ -338,6 +362,7 @@ export function FileManager({
           }
         : undefined,
       onMove: resolvedCapabilities.move ? (item) => setMoveTargetIds([item.id]) : undefined,
+      onTransfer: resolvedCapabilities.transfer ? (item) => setTransferTarget(item) : undefined,
       onDownload: handleDownload,
       onShare: resolvedCapabilities.share ? (item) => setShareTarget(item) : undefined,
       onCopyUrl: resolvedCapabilities.copyUrl && onCopyUrl ? onCopyUrl : undefined,
@@ -393,10 +418,92 @@ export function FileManager({
     archiveMutation.mutate({ type: 'archive_compress', matterIds: selectedIds })
   }, [archiveMutation, selectedIds])
 
+  const runFileOperation = useCallback(
+    async (
+      title: string,
+      ids: string[],
+      action: (id: string) => Promise<unknown>,
+      successMessage: string,
+      invalidation: () => void = mutations.invalidate,
+    ) => {
+      operationCancelRef.current = false
+      const namesById = new Map(items.map((item) => [item.id, item.name]))
+      setOperationState({
+        title,
+        total: ids.length,
+        completed: 0,
+        currentName: '',
+        cancelRequested: false,
+        finished: false,
+        failures: [],
+      })
+
+      const result = await runSequentialOperation({
+        items: ids,
+        shouldCancel: () => operationCancelRef.current,
+        onItemStart: (id) => {
+          setOperationState((state) => (state ? { ...state, currentName: namesById.get(id) ?? id } : state))
+        },
+        onItemComplete: (_id, index) => {
+          setOperationState((state) => (state ? { ...state, completed: index + 1 } : state))
+        },
+        onItemFailure: (id, error, index) => {
+          setOperationState((state) =>
+            state
+              ? {
+                  ...state,
+                  completed: index + 1,
+                  failures: [
+                    ...state.failures,
+                    { name: namesById.get(id) ?? id, message: error.message || t('common.error') },
+                  ],
+                }
+              : state,
+          )
+        },
+        runItem: action,
+      })
+
+      invalidation()
+      if (result.failed.length > 0) {
+        setOperationState((state) => (state ? { ...state, finished: true, currentName: '' } : state))
+        toast.error(t('files.operationFailedSummary', { failed: result.failed.length, total: ids.length }))
+        return result
+      }
+      setOperationState(null)
+      if (result.cancelled) {
+        toast.info(t('files.operationCancelled', { completed: result.completed, total: ids.length }))
+        return result
+      }
+      toast.success(successMessage)
+      return result
+    },
+    [items, mutations.invalidate, t],
+  )
+
+  function requestOperationCancel() {
+    operationCancelRef.current = true
+    setOperationState((state) => (state ? { ...state, cancelRequested: true } : state))
+  }
+
+  function dismissOperation() {
+    setOperationState(null)
+    if (deleteTargetIds.length > 0) setDeleteTargetIds([])
+    if (moveTargetIds.length > 0) setMoveTargetIds([])
+    setRowSelection({})
+  }
+
   function handleDndDrop(fileIds: string[], targetFolderId: string) {
     conflict.reset()
-    withConflictRetry(conflict.prompt, 'file', (strategy) =>
-      mutations.moveMutation.mutateAsync({ ids: fileIds, parent: targetFolderId, onConflict: strategy }),
+    runFileOperation(
+      t('files.moveTo'),
+      fileIds,
+      async (id) => {
+        await withConflictRetry(conflict.prompt, 'file', (strategy) =>
+          updateObject(id, { parent: targetFolderId, onConflict: strategy }),
+        )
+      },
+      t('files.moveSuccess'),
     ).catch((err) => toast.error(err.message))
   }
 
@@ -549,6 +656,11 @@ export function FileManager({
             />
           </div>
         )}
+        {query.hasNextPage && (
+          <div ref={loadMoreRef} className="py-3 text-center text-sm text-muted-foreground">
+            {query.isFetchingNextPage ? t('common.loading') : ''}
+          </div>
+        )}
       </FileManagerSurface>
 
       {resolvedCapabilities.rename ||
@@ -556,72 +668,84 @@ export function FileManager({
       resolvedCapabilities.trash ||
       resolvedCapabilities.move ||
       resolvedCapabilities.share ? (
-        <>
-          <FileManagerDialogs
-            renameTarget={renameTarget}
-            onRenameClose={() => setRenameTarget(null)}
-            onRenameConfirm={(name) => {
-              if (!renameTarget) return
-              const kind = renameTarget.dirtype === DirType.FILE ? 'file' : 'folder'
-              conflict.reset()
-              withConflictRetry(conflict.prompt, kind, (strategy) =>
-                mutations.renameMutation.mutateAsync({ id: renameTarget.id, name, onConflict: strategy }),
-              )
-                .then(() => setRenameTarget(null))
-                .catch((err) => toast.error(err.message))
-            }}
-            renamePending={mutations.renameMutation.isPending}
-            showNewFolder={showNewFolder}
-            onNewFolderClose={() => setShowNewFolder(false)}
-            onNewFolderConfirm={(name) => {
-              conflict.reset()
-              withConflictRetry(conflict.prompt, 'folder', (strategy) =>
-                mutations.createFolderMutation.mutateAsync({ name, onConflict: strategy }),
-              )
-                .then(() => setShowNewFolder(false))
-                .catch((err) => toast.error(err.message))
-            }}
-            newFolderPending={mutations.createFolderMutation.isPending}
-            deleteTargetIds={deleteTargetIds}
-            onDeleteClose={() => setDeleteTargetIds([])}
-            onDeleteConfirm={() => {
-              mutations.trashMutation.mutate(deleteTargetIds, {
-                onSuccess: () => {
-                  setDeleteTargetIds([])
-                  setRowSelection({})
-                },
+        <FileManagerDialogs
+          renameTarget={renameTarget}
+          onRenameClose={() => setRenameTarget(null)}
+          onRenameConfirm={(name) => {
+            if (!renameTarget) return
+            const kind = renameTarget.dirtype === DirType.FILE ? 'file' : 'folder'
+            conflict.reset()
+            withConflictRetry(conflict.prompt, kind, (strategy) =>
+              mutations.renameMutation.mutateAsync({ id: renameTarget.id, name, onConflict: strategy }),
+            )
+              .then(() => setRenameTarget(null))
+              .catch((err) => toast.error(err.message))
+          }}
+          renamePending={mutations.renameMutation.isPending}
+          showNewFolder={showNewFolder}
+          onNewFolderClose={() => setShowNewFolder(false)}
+          onNewFolderConfirm={(name) => {
+            conflict.reset()
+            withConflictRetry(conflict.prompt, 'folder', (strategy) =>
+              mutations.createFolderMutation.mutateAsync({ name, onConflict: strategy }),
+            )
+              .then(() => setShowNewFolder(false))
+              .catch((err) => toast.error(err.message))
+          }}
+          newFolderPending={mutations.createFolderMutation.isPending}
+          deleteTargetIds={deleteTargetIds}
+          operation={operationState}
+          onOperationCancel={requestOperationCancel}
+          onOperationDismiss={dismissOperation}
+          onDeleteClose={() => setDeleteTargetIds([])}
+          onDeleteConfirm={() => {
+            const ids = [...deleteTargetIds]
+            runFileOperation(t('files.moveToTrash'), ids, (id) => deleteObject(id), t('files.trashSuccess'))
+              .then(() => {
+                setDeleteTargetIds([])
+                setRowSelection({})
               })
-            }}
-            deletePending={mutations.trashMutation.isPending}
-            moveTargetIds={moveTargetIds}
-            onMoveClose={() => setMoveTargetIds([])}
-            onMoveConfirm={(targetFolderId) => {
-              conflict.reset()
-              withConflictRetry(
-                conflict.prompt,
-                'file',
-                (strategy) =>
-                  mutations.moveMutation.mutateAsync({
-                    ids: moveTargetIds,
-                    parent: targetFolderId,
-                    onConflict: strategy,
-                  }),
-                { showApplyToAll: moveTargetIds.length > 1 },
-              )
-                .then(() => {
-                  setMoveTargetIds([])
-                  setRowSelection({})
-                })
-                .catch((err) => toast.error(err.message))
-            }}
-            movePending={mutations.moveMutation.isPending}
-            shareTarget={shareTarget}
-            onShareClose={() => setShareTarget(null)}
-          />
-
-          <NameConflictDialog {...conflict.dialogState} />
-        </>
+              .catch((err) => toast.error(err.message))
+          }}
+          deletePending={!!operationState}
+          moveTargetIds={moveTargetIds}
+          onMoveClose={() => setMoveTargetIds([])}
+          onMoveConfirm={(targetFolderId) => {
+            conflict.reset()
+            const ids = [...moveTargetIds]
+            runFileOperation(
+              t('files.moveTo'),
+              ids,
+              async (id) => {
+                await withConflictRetry(
+                  conflict.prompt,
+                  'file',
+                  (strategy) => updateObject(id, { parent: targetFolderId, onConflict: strategy }),
+                  { showApplyToAll: ids.length > 1 },
+                )
+              },
+              t('files.moveSuccess'),
+            )
+              .then(() => {
+                setMoveTargetIds([])
+                setRowSelection({})
+              })
+              .catch((err) => toast.error(err.message))
+          }}
+          movePending={!!operationState}
+          shareTarget={shareTarget}
+          onShareClose={() => setShareTarget(null)}
+          conflictDialogState={conflict.dialogState}
+        />
       ) : null}
+
+      <TransferSpaceDialog
+        item={transferTarget}
+        onOpenChange={(open) => {
+          if (!open) setTransferTarget(null)
+        }}
+        onCompleted={() => mutations.invalidate()}
+      />
 
       <FilePreviewDialog file={previewFile} open={previewOpen} onOpenChange={setPreviewOpen} />
     </div>

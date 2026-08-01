@@ -1,14 +1,26 @@
-import { eq } from 'drizzle-orm'
-import { describe, expect, it } from 'vitest'
+import { createHash } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { isPersonalOrgLike } from '@shared/org-slugs'
+import { deriveDpopAth } from 'better-auth/oauth2'
+import { eq, sql } from 'drizzle-orm'
+import { exportJWK, generateKeyPair, SignJWT } from 'jose'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createInviteRepo } from './adapters/repos/invite.js'
+import { createSiteInvitationRepo } from './adapters/repos/site-invitations.js'
+import { createApp } from './app.js'
 import { createAuth } from './auth.js'
 import * as authSchema from './db/auth-schema.js'
 import * as schema from './db/schema.js'
 import { inviteCodes, siteInvitations } from './db/schema.js'
-import { generateInviteCodes } from './services/invite.js'
-import { createSiteInvitation } from './services/site-invitations.js'
-import { createTestApp, seedProLicense } from './test/setup.js'
+import { auditActor } from './middleware/audit-actor.js'
+import { adminHeaders, createTestApp, seedProLicense } from './test/setup.js'
 
 type TestCtx = Awaited<ReturnType<typeof createTestApp>>
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
 
 async function signUp(ctx: TestCtx, email: string, extra?: Record<string, unknown>) {
   return ctx.app.request('/api/auth/sign-up/email', {
@@ -16,6 +28,17 @@ async function signUp(ctx: TestCtx, email: string, extra?: Record<string, unknow
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name: 'Test User', email, password: 'password123456', ...extra }),
   })
+}
+
+async function configureRequiredEmailVerification(ctx: TestCtx) {
+  await ctx.db.insert(schema.systemOptions).values([
+    { key: 'email_enabled', value: 'true' },
+    { key: 'email_provider', value: 'http' },
+    { key: 'email_from', value: 'no-reply@example.com' },
+    { key: 'email_http_url', value: 'https://api.mail.example.com/send' },
+    { key: 'email_http_api_key', value: 'my-api-key' },
+    { key: 'auth_require_email_verification', value: 'true' },
+  ])
 }
 
 async function expectPlanEntitlement(ctx: TestCtx, resourceType: 'storage' | 'traffic', bytes: number) {
@@ -31,6 +54,21 @@ async function expectPlanEntitlement(ctx: TestCtx, resourceType: 'storage' | 'tr
       }),
     ]),
   )
+}
+
+async function personalOrgForUser(ctx: TestCtx, userId: string): Promise<string> {
+  const rows = await ctx.db
+    .select({
+      id: authSchema.organization.id,
+      slug: authSchema.organization.slug,
+      metadata: authSchema.organization.metadata,
+    })
+    .from(authSchema.member)
+    .innerJoin(authSchema.organization, eq(authSchema.organization.id, authSchema.member.organizationId))
+    .where(eq(authSchema.member.userId, userId))
+  const org = rows.find(isPersonalOrgLike)
+  if (!org) throw new Error(`No personal org found for user ${userId}`)
+  return org.id
 }
 
 describe('registration gate — first user always allowed', () => {
@@ -74,7 +112,7 @@ describe('registration gate — open mode', () => {
 
   it('second user can register when auth_signup_mode is explicitly open and instance has Pro license', async () => {
     const ctx = await createTestApp()
-    await seedProLicense(ctx.db, ['open_registration'])
+    await seedProLicense(ctx.db)
     await ctx.db.insert(schema.systemOptions).values({ key: 'auth_signup_mode', value: 'open' })
     await signUp(ctx, 'first@example.com')
     const res = await signUp(ctx, 'second@example.com')
@@ -125,7 +163,7 @@ describe('registration gate — closed mode', () => {
       .from(authSchema.user)
       .where(eq(authSchema.user.email, 'first@example.com'))
       .limit(1)
-    const invitation = await createSiteInvitation(ctx.db, admin.id, 'invited@example.com')
+    const invitation = await createSiteInvitationRepo(ctx.db).createSiteInvitation(admin.id, 'invited@example.com')
 
     const res = await signUp(ctx, 'invited@example.com', { siteInvitationToken: invitation.token })
 
@@ -141,7 +179,7 @@ describe('registration gate — closed mode', () => {
       .from(authSchema.user)
       .where(eq(authSchema.user.email, 'first@example.com'))
       .limit(1)
-    const invitation = await createSiteInvitation(ctx.db, admin.id, 'invited@example.com')
+    const invitation = await createSiteInvitationRepo(ctx.db).createSiteInvitation(admin.id, 'invited@example.com')
 
     const res = await signUp(ctx, 'invited@example.com', { siteInvitationToken: invitation.token })
     const body = (await res.json()) as { user: { id: string } }
@@ -164,7 +202,7 @@ describe('registration gate — closed mode', () => {
       .from(authSchema.user)
       .where(eq(authSchema.user.email, 'first@example.com'))
       .limit(1)
-    const invitation = await createSiteInvitation(ctx.db, admin.id, 'invited@example.com')
+    const invitation = await createSiteInvitationRepo(ctx.db).createSiteInvitation(admin.id, 'invited@example.com')
 
     const res = await signUp(ctx, 'other@example.com', { siteInvitationToken: invitation.token })
 
@@ -202,7 +240,7 @@ describe('registration gate — invite_only mode', () => {
     await ctx.db.insert(schema.systemOptions).values({ key: 'auth_signup_mode', value: 'invite_only' })
     await signUp(ctx, 'first@example.com')
     const pastDate = new Date(Date.now() - 1000)
-    const [codeRow] = await generateInviteCodes(ctx.db, 'admin-1', 1, pastDate)
+    const [codeRow] = await createInviteRepo(ctx.db).generate('admin-1', 1, pastDate)
     const res = await signUp(ctx, 'expired@example.com', { inviteCode: codeRow.code })
     expect(res.status).not.toBe(200)
   })
@@ -211,7 +249,7 @@ describe('registration gate — invite_only mode', () => {
     const ctx = await createTestApp()
     await ctx.db.insert(schema.systemOptions).values({ key: 'auth_signup_mode', value: 'invite_only' })
     await signUp(ctx, 'first@example.com')
-    const [codeRow] = await generateInviteCodes(ctx.db, 'admin-1', 1)
+    const [codeRow] = await createInviteRepo(ctx.db).generate('admin-1', 1)
     const res = await signUp(ctx, 'invited@example.com', { inviteCode: codeRow.code })
     expect(res.status).toBe(200)
   })
@@ -220,7 +258,7 @@ describe('registration gate — invite_only mode', () => {
     const ctx = await createTestApp()
     await ctx.db.insert(schema.systemOptions).values({ key: 'auth_signup_mode', value: 'invite_only' })
     await signUp(ctx, 'first@example.com')
-    const [codeRow] = await generateInviteCodes(ctx.db, 'admin-1', 1)
+    const [codeRow] = await createInviteRepo(ctx.db).generate('admin-1', 1)
     const res = await signUp(ctx, 'invited2@example.com', { inviteCode: codeRow.code })
     const body = (await res.json()) as { user: { id: string } }
     const [row] = await ctx.db.select().from(inviteCodes).where(eq(inviteCodes.code, codeRow.code))
@@ -232,7 +270,7 @@ describe('registration gate — invite_only mode', () => {
     const ctx = await createTestApp()
     await ctx.db.insert(schema.systemOptions).values({ key: 'auth_signup_mode', value: 'invite_only' })
     await signUp(ctx, 'first@example.com')
-    const [codeRow] = await generateInviteCodes(ctx.db, 'admin-1', 1)
+    const [codeRow] = await createInviteRepo(ctx.db).generate('admin-1', 1)
     await signUp(ctx, 'user1@example.com', { inviteCode: codeRow.code })
     const res = await signUp(ctx, 'user2@example.com', { inviteCode: codeRow.code })
     expect(res.status).not.toBe(200)
@@ -281,6 +319,190 @@ describe('isEmailConfigured — via emailVerification conditional', () => {
     })
     // The endpoint returns 200 regardless; the callback silently returns early
     expect(res.status).toBe(200)
+  })
+})
+
+describe('Better Auth account issuer migration', () => {
+  it('restores email sign-in for a legacy credential account', async () => {
+    const ctx = await createTestApp()
+    const email = 'legacy-issuer@example.com'
+    await signUp(ctx, email)
+    await ctx.db
+      .update(authSchema.account)
+      .set({ issuer: '' })
+      .where(
+        eq(
+          authSchema.account.userId,
+          (await ctx.db.query.user.findFirst({ where: eq(authSchema.user.email, email) }))!.id,
+        ),
+      )
+
+    const rejected = await ctx.app.request('/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password: 'password123456' }),
+    })
+    expect(rejected.status).toBe(401)
+
+    const migration = readFileSync(
+      join(process.cwd(), 'migrations/0089_better-auth-account-issuer-backfill.sql'),
+      'utf-8',
+    )
+    for (const statement of migration.split('--> statement-breakpoint')) {
+      await ctx.db.run(sql.raw(statement))
+    }
+
+    const restored = await ctx.app.request('/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password: 'password123456' }),
+    })
+    expect(restored.status).toBe(200)
+    expect(restored.headers.getSetCookie()).not.toHaveLength(0)
+  })
+})
+
+describe('dynamic email verification policy', () => {
+  it('requires verification immediately and resends the email on sign-in', async () => {
+    const { vi } = await import('vitest')
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true })
+    vi.stubGlobal('fetch', fetchMock)
+
+    try {
+      const ctx = await createTestApp()
+      await configureRequiredEmailVerification(ctx)
+
+      const signUpResponse = await signUp(ctx, 'required@example.com', { username: 'required_user' })
+      expect(signUpResponse.status).toBe(200)
+      await expect(signUpResponse.json()).resolves.toMatchObject({ token: null })
+      expect(await ctx.db.select().from(authSchema.session)).toHaveLength(0)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+
+      const signInResponse = await ctx.app.request('/api/auth/sign-in/email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'required@example.com', password: 'password123456' }),
+      })
+      expect(signInResponse.status).toBe(403)
+      await expect(signInResponse.json()).resolves.toMatchObject({ code: 'EMAIL_NOT_VERIFIED' })
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+
+      const usernameSignInResponse = await ctx.app.request('/api/auth/sign-in/username', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'required_user', password: 'password123456' }),
+      })
+      expect(usernameSignInResponse.status).toBe(403)
+      await expect(usernameSignInResponse.json()).resolves.toMatchObject({ code: 'EMAIL_NOT_VERIFIED' })
+      expect(fetchMock).toHaveBeenCalledTimes(3)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('accepts the verification link and marks the user as verified', async () => {
+    const { vi } = await import('vitest')
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true })
+    vi.stubGlobal('fetch', fetchMock)
+
+    try {
+      const ctx = await createTestApp()
+      await configureRequiredEmailVerification(ctx)
+      await signUp(ctx, 'verify-required@example.com')
+
+      const request = fetchMock.mock.calls[0]?.[1] as RequestInit | undefined
+      const payload = JSON.parse(String(request?.body)) as { html: string }
+      const verificationUrl = payload.html.match(/href="([^"]+)"/)?.[1]
+      if (!verificationUrl) throw new Error('Verification email did not contain a link')
+
+      const url = new URL(verificationUrl)
+      const verifyResponse = await ctx.app.request(`${url.pathname}${url.search}`)
+      expect(verifyResponse.status).toBe(302)
+
+      const [user] = await ctx.db
+        .select({ emailVerified: authSchema.user.emailVerified })
+        .from(authSchema.user)
+        .where(eq(authSchema.user.email, 'verify-required@example.com'))
+        .limit(1)
+      expect(user.emailVerified).toBe(true)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('applies a disabled policy without recreating the auth service', async () => {
+    const { vi } = await import('vitest')
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true }))
+
+    try {
+      const ctx = await createTestApp()
+      await configureRequiredEmailVerification(ctx)
+      await signUp(ctx, 'toggle@example.com')
+      await ctx.db
+        .update(schema.systemOptions)
+        .set({ value: 'false' })
+        .where(eq(schema.systemOptions.key, 'auth_require_email_verification'))
+
+      const signInResponse = await ctx.app.request('/api/auth/sign-in/email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'toggle@example.com', password: 'password123456' }),
+      })
+      expect(signInResponse.status).toBe(200)
+      expect(signInResponse.headers.getSetCookie()).not.toHaveLength(0)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
+describe('last login method', () => {
+  it('records email sign-in in a client-readable cookie', async () => {
+    const ctx = await createTestApp()
+    await signUp(ctx, 'last-email@example.com')
+
+    const response = await ctx.app.request('/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'last-email@example.com', password: 'password123456' }),
+    })
+
+    expect(response.status).toBe(200)
+    expect(response.headers.getSetCookie()).toEqual(
+      expect.arrayContaining([expect.stringContaining('better-auth.last_used_login_method=email')]),
+    )
+  })
+
+  it('records username sign-in in a client-readable cookie', async () => {
+    const ctx = await createTestApp()
+    await signUp(ctx, 'last-username@example.com', { username: 'last_username' })
+
+    const response = await ctx.app.request('/api/auth/sign-in/username', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'last_username', password: 'password123456' }),
+    })
+
+    expect(response.status).toBe(200)
+    expect(response.headers.getSetCookie()).toEqual(
+      expect.arrayContaining([expect.stringContaining('better-auth.last_used_login_method=username')]),
+    )
+  })
+
+  it('does not update the cookie when sign-in fails', async () => {
+    const ctx = await createTestApp()
+    await signUp(ctx, 'last-failed@example.com')
+
+    const response = await ctx.app.request('/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'last-failed@example.com', password: 'wrong-password' }),
+    })
+
+    expect(response.status).toBe(401)
+    expect(response.headers.getSetCookie()).not.toEqual(
+      expect.arrayContaining([expect.stringContaining('better-auth.last_used_login_method=')]),
+    )
   })
 })
 
@@ -348,9 +570,21 @@ describe('buildVerificationEmailHtml — via send-verification-email with email_
   })
 })
 
-describe('loadOidcConfigs — createAuth with OIDC provider pre-configured', () => {
+describe('loadProviderConfigs — createAuth with OIDC provider pre-configured', () => {
   it('createAuth succeeds when a valid enabled OIDC provider config is present', async () => {
     const ctx = await createTestApp()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        Response.json({
+          issuer: 'https://auth.example.com',
+          authorization_endpoint: 'https://auth.example.com/authorize',
+          token_endpoint: 'https://auth.example.com/token',
+          userinfo_endpoint: 'https://auth.example.com/userinfo',
+          jwks_uri: 'https://auth.example.com/jwks',
+        }),
+      ),
+    )
     const oidcConfig = JSON.stringify({
       providerId: 'my-oidc',
       type: 'oidc',
@@ -388,17 +622,15 @@ describe('loadOidcConfigs — createAuth with OIDC provider pre-configured', () 
   })
 })
 
-describe('loadProviderConfig — builtin social provider resolution', () => {
-  it('social sign-in with an unconfigured provider returns non-200 (provider not enabled)', async () => {
+describe('loadProviderConfigs — builtin social provider resolution', () => {
+  it('social sign-in with an unconfigured provider returns non-200 (provider not registered)', async () => {
     const ctx = await createTestApp()
-    // Trigger the lazy provider resolver by initiating social sign-in.
-    // With no config in DB the provider returns enabled:false.
+    // With no config in DB the provider is not registered with better-auth.
     const res = await ctx.app.request('/api/auth/sign-in/social', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ provider: 'github', callbackURL: 'http://localhost:3000/callback' }),
     })
-    // better-auth returns an error because the provider is disabled
     expect(res.status).not.toBe(200)
   })
 
@@ -412,14 +644,569 @@ describe('loadProviderConfig — builtin social provider resolution', () => {
       enabled: true,
     })
     await ctx.db.insert(schema.systemOptions).values({ key: 'oauth_provider_github', value: builtinConfig })
-    // Trigger social sign-in — this calls the async provider loader which hits loadProviderConfig
-    const res = await ctx.app.request('/api/auth/sign-in/social', {
+    // Provider configs are snapshotted when the auth instance is created —
+    // build a fresh auth/app that sees the seeded config.
+    const auth = await createAuth(ctx.platform, 'test-secret', 'http://localhost:3000')
+    const app = createApp(ctx.platform, auth)
+    const res = await app.request('/api/auth/sign-in/social', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ provider: 'github', callbackURL: 'http://localhost:3000/callback' }),
     })
     // With a valid enabled provider, better-auth returns a redirect (302) to the OAuth provider
     expect([200, 302]).toContain(res.status)
+  })
+
+  it('social sign-in with a configured and enabled OIDC provider returns a redirect', async () => {
+    const ctx = await createTestApp()
+    const oidcConfig = JSON.stringify({
+      providerId: 'my-oidc',
+      type: 'oidc',
+      clientId: 'oidc-client',
+      clientSecret: 'oidc-secret',
+      enabled: true,
+      discoveryUrl: 'https://auth.example.com/.well-known/openid-configuration',
+      scopes: ['openid', 'email'],
+    })
+    await ctx.db.insert(schema.systemOptions).values({ key: 'oauth_provider_my-oidc', value: oidcConfig })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+        if (url === 'https://auth.example.com/.well-known/openid-configuration') {
+          return new Response(
+            JSON.stringify({
+              issuer: 'https://auth.example.com',
+              authorization_endpoint: 'https://auth.example.com/oauth2/authorize',
+              token_endpoint: 'https://auth.example.com/oauth2/token',
+              jwks_uri: 'https://auth.example.com/.well-known/jwks.json',
+              response_types_supported: ['code'],
+              subject_types_supported: ['public'],
+              id_token_signing_alg_values_supported: ['RS256'],
+            }),
+            {
+              headers: { 'Content-Type': 'application/json' },
+            },
+          )
+        }
+        throw new Error(`unexpected fetch: ${url}`)
+      }),
+    )
+    const auth = await createAuth(ctx.platform, 'test-secret', 'http://localhost:3000')
+    const app = createApp(ctx.platform, auth)
+    const res = await app.request('/api/auth/sign-in/social', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'my-oidc', callbackURL: 'http://localhost:3000/callback' }),
+    })
+
+    expect([200, 302]).toContain(res.status)
+  })
+
+  it('social sign-in ignores a disabled builtin provider config', async () => {
+    const ctx = await createTestApp()
+    const builtinConfig = JSON.stringify({
+      providerId: 'github',
+      type: 'builtin',
+      clientId: 'gh-client',
+      clientSecret: 'gh-secret',
+      enabled: false,
+    })
+    await ctx.db.insert(schema.systemOptions).values({ key: 'oauth_provider_github', value: builtinConfig })
+    const auth = await createAuth(ctx.platform, 'test-secret', 'http://localhost:3000')
+    const app = createApp(ctx.platform, auth)
+    const res = await app.request('/api/auth/sign-in/social', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'github', callbackURL: 'http://localhost:3000/callback' }),
+    })
+
+    expect(res.status).not.toBe(200)
+  })
+
+  it('createAuth initializes provider config and OAuth resources without scanning OAuth clients', async () => {
+    const ctx = await createTestApp()
+    let selectCalls = 0
+    const countingDb = new Proxy(ctx.db, {
+      get(target, prop, receiver) {
+        if (prop === 'select') selectCalls++
+        const val = Reflect.get(target, prop, receiver)
+        return typeof val === 'function' ? val.bind(target) : val
+      },
+    })
+    await createAuth(countingDb as typeof ctx.db, 'test-secret', 'http://localhost:3000')
+    expect(selectCalls).toBe(3)
+  })
+
+  it('createAuth resolves better-auth $context before returning', async () => {
+    // A cached auth instance must never carry a pending init promise: on
+    // Cloudflare Workers a promise created in one request never settles when
+    // awaited from another, hanging every auth call in the isolate.
+    const ctx = await createTestApp()
+    let settled = false
+    void ctx.auth.$context.then(() => {
+      settled = true
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(settled).toBe(true)
+  })
+})
+
+describe('Cloudflare Workers preview auth origins', () => {
+  const configuredOrigin = 'https://zpan-staging.saltbo.workers.dev'
+  const commitOrigin = 'https://99dc50ae-zpan.saltbo.workers.dev'
+  const branchOrigin = 'https://feat-x402-paid-agent-uploads-zpan.saltbo.workers.dev'
+
+  it('accepts official commit and branch aliases on the same cached auth instance', async () => {
+    const ctx = await createTestApp()
+    const auth = await createAuth(ctx.platform, 'test-secret', configuredOrigin, [configuredOrigin])
+    const app = createApp(ctx.platform, auth)
+    const email = `preview-${Date.now()}@example.com`
+    const password = 'password123456'
+    const signUp = await app.request(`${configuredOrigin}/api/auth/sign-up/email`, {
+      method: 'POST',
+      headers: { Origin: configuredOrigin, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Preview User', email, password }),
+    })
+    expect(signUp.status).toBe(200)
+
+    for (const origin of [commitOrigin, branchOrigin]) {
+      const signIn = await app.request(`${origin}/api/auth/sign-in/email`, {
+        method: 'POST',
+        headers: { Origin: origin, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password, callbackURL: `${origin}/files` }),
+      })
+      expect(signIn.status, await signIn.clone().text()).toBe(200)
+    }
+  })
+
+  it('rejects unrelated workers.dev origins', async () => {
+    const ctx = await createTestApp()
+    const auth = await createAuth(ctx.platform, 'test-secret', configuredOrigin, [configuredOrigin])
+    const app = createApp(ctx.platform, auth)
+    const origin = 'https://unrelated-worker.other-account.workers.dev'
+    const signIn = await app.request(`${origin}/api/auth/sign-in/email`, {
+      method: 'POST',
+      headers: { Origin: origin, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'nobody@example.com', password: 'password123456', callbackURL: `${origin}/files` }),
+    })
+
+    expect(signIn.status).toBe(403)
+  })
+})
+
+describe('Agent OAuth consent guards', () => {
+  it('publishes the external resource discovery contract at the exact API URL', async () => {
+    const ctx = await createTestApp()
+    const resource = await ctx.app.request('http://localhost:3000/api')
+    const metadata = await ctx.app.request('http://localhost:3000/.well-known/oauth-protected-resource/api')
+    const authorizationServer = await ctx.app.request(
+      'http://localhost:3000/.well-known/oauth-authorization-server/api/auth',
+    )
+
+    expect(resource.status).toBe(200)
+    expect(resource.headers.get('link')).toBe(
+      [
+        '</api/openapi.json>; rel="service-desc"; type="application/openapi+json"',
+        '</api/workflows.arazzo.json>; rel="describedby"; type="application/vnd.oai.workflows+json"',
+      ].join(', '),
+    )
+    await expect(metadata.json()).resolves.toMatchObject({
+      resource: 'http://localhost:3000/api',
+      authorization_servers: ['http://localhost:3000/api/auth'],
+    })
+    await expect(authorizationServer.json()).resolves.toMatchObject({
+      registration_endpoint: 'http://localhost:3000/api/auth/oauth2/register',
+      grant_types_supported: expect.arrayContaining([
+        'urn:ietf:params:oauth:grant-type:jwt-bearer',
+        'urn:ietf:params:oauth:grant-type:token-exchange',
+      ]),
+      dpop_signing_alg_values_supported: expect.any(Array),
+    })
+  })
+
+  it('dynamically registers an external resource client without hard-coded identity', async () => {
+    const ctx = await createTestApp()
+    const res = await ctx.app.request('/api/auth/oauth2/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_name: 'External Resource Broker',
+        redirect_uris: ['https://broker.example.com/api/account-connections/oauth/callback'],
+        grant_types: [
+          'authorization_code',
+          'refresh_token',
+          'urn:ietf:params:oauth:grant-type:jwt-bearer',
+          'urn:ietf:params:oauth:grant-type:token-exchange',
+        ],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'client_secret_basic',
+        scope: 'openid offline_access',
+        jwks_uri: 'https://broker.example.com/api/auth/jwks',
+      }),
+    })
+    const body = (await res.json()) as Record<string, unknown>
+
+    expect(res.status, JSON.stringify(body)).toBe(201)
+    expect(body).toMatchObject({
+      client_id: expect.any(String),
+      client_secret: expect.any(String),
+      token_endpoint_auth_method: 'client_secret_basic',
+    })
+    expect(String(body.scope).split(' ')).toEqual(expect.arrayContaining(['openid', 'offline_access', 'objects:read']))
+
+    const applicationsResponse = await ctx.app.request('/api/site/auth-providers', {
+      headers: await adminHeaders(ctx.app),
+    })
+    const applications = (await applicationsResponse.json()) as {
+      registeredApplications: Array<{ clientId: string; name: string }>
+    }
+    expect(applicationsResponse.status).toBe(200)
+    expect(applications.registeredApplications).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          clientId: body.client_id,
+          name: 'External Resource Broker',
+        }),
+      ]),
+    )
+  })
+
+  it('returns a DPoP challenge for a foreign access token instead of an internal error', async () => {
+    const ctx = await createTestApp()
+    const apiUrl = 'http://localhost:3000/api/objects'
+    const { privateKey: foreignPrivateKey } = await generateKeyPair('ES256')
+    const { privateKey: dpopPrivateKey, publicKey: dpopPublicKey } = await generateKeyPair('ES256')
+    const dpopPublicJwk = await exportJWK(dpopPublicKey)
+    const accessToken = await new SignJWT({
+      sub: 'foreign-user',
+      client_id: 'foreign-client',
+      zpan_org_id: 'foreign-workspace',
+      act: { sub: 'foreign-agent', iss: 'https://identity.example.com/api/auth' },
+      scope: 'objects:create',
+      cnf: { jkt: 'foreign-thumbprint' },
+    })
+      .setProtectedHeader({ typ: 'JWT', alg: 'ES256', kid: 'foreign-key' })
+      .setIssuer('http://localhost:3000/api/auth')
+      .setAudience('http://localhost:3000/api')
+      .setIssuedAt()
+      .setExpirationTime('5m')
+      .setJti(crypto.randomUUID())
+      .sign(foreignPrivateKey)
+    const proof = await new SignJWT({
+      htm: 'POST',
+      htu: apiUrl,
+      ath: await deriveDpopAth(accessToken),
+    })
+      .setProtectedHeader({ typ: 'dpop+jwt', alg: 'ES256', jwk: dpopPublicJwk })
+      .setIssuedAt()
+      .setJti(crypto.randomUUID())
+      .sign(dpopPrivateKey)
+    const getJwks = ctx.auth.api.getJwks
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request) => {
+        const url = input instanceof Request ? input.url : String(input)
+        if (url === 'http://localhost:3000/api/auth/jwks') return Response.json(await getJwks())
+        throw new Error(`unexpected fetch: ${url}`)
+      }),
+    )
+
+    const response = await ctx.app.request(apiUrl, {
+      method: 'POST',
+      headers: { Authorization: `DPoP ${accessToken}`, DPoP: proof, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'foreign.txt', size: 1, type: 'text/plain', dirtype: 0, parent: '' }),
+    })
+
+    expect(response.status).toBe(401)
+    expect(response.headers.get('www-authenticate')).toContain('DPoP')
+    expect(response.headers.get('www-authenticate')).toContain('/.well-known/oauth-protected-resource/api')
+  })
+
+  it('issues a DPoP API token through JWT bearer and token exchange grants', async () => {
+    const ctx = await createTestApp()
+    ctx.app.get('/api/test-agent-audit', async (c) => {
+      const principal = c.get('principal')
+      if (principal?.kind !== 'agent-oauth') return c.json({ error: 'agent principal required' }, 401)
+      await c.get('deps').audit.record({
+        ...auditActor(principal),
+        orgId: principal.orgId,
+        action: 'agent_identity_probe',
+        targetType: 'route',
+        targetName: 'Agent identity probe',
+      })
+      return c.json({ ok: true })
+    })
+    const { privateKey: agentPrivateKey, publicKey: agentPublicKey } = await generateKeyPair('ES256')
+    const agentPublicJwk = { ...(await exportJWK(agentPublicKey)), kid: 'agent-key', use: 'sig', alg: 'ES256' }
+    const getJwks = ctx.auth.api.getJwks
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request) => {
+        const url = input instanceof Request ? input.url : String(input)
+        if (url === 'https://broker.example.com/api/auth/jwks') {
+          return Response.json({ keys: [agentPublicJwk] })
+        }
+        if (url === 'http://localhost:3000/api/auth/jwks') {
+          return Response.json(await getJwks())
+        }
+        throw new Error(`Unexpected fetch: ${url}`)
+      }),
+    )
+
+    const registration = await ctx.app.request('http://localhost:3000/api/auth/oauth2/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_name: 'External Resource Broker',
+        redirect_uris: ['https://broker.example.com/api/account-connections/oauth/callback'],
+        grant_types: [
+          'authorization_code',
+          'refresh_token',
+          'urn:ietf:params:oauth:grant-type:jwt-bearer',
+          'urn:ietf:params:oauth:grant-type:token-exchange',
+        ],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'client_secret_basic',
+        scope: 'openid offline_access',
+        jwks_uri: 'https://broker.example.com/api/auth/jwks',
+      }),
+    })
+    const registered = (await registration.json()) as { client_id: string; client_secret: string }
+    expect(registration.status).toBe(201)
+
+    const signUpResponse = await signUp(ctx, 'external-resource@example.com')
+    const cookie = signUpResponse.headers
+      .getSetCookie()
+      .map((value) => value.split(';', 1)[0])
+      .join('; ')
+    const verifier = 'external-resource-verifier-with-sufficient-entropy-1234567890'
+    const challenge = createHash('sha256').update(verifier).digest('base64url')
+    const redirectUri = 'https://broker.example.com/api/account-connections/oauth/callback'
+    const scope = 'openid offline_access objects:read quota:read'
+    const authorizeParams = new URLSearchParams({
+      client_id: registered.client_id,
+      redirect_uri: redirectUri,
+      response_type: 'code',
+      resource: 'http://localhost:3000/api',
+      scope,
+      state: 'external-resource',
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+    })
+    const authorize = await ctx.app.request(
+      `http://localhost:3000/api/auth/oauth2/authorize?${authorizeParams.toString()}`,
+      { headers: { Cookie: cookie, Origin: 'http://localhost:3000' } },
+    )
+    const consentLocation = authorize.headers.get('location')
+    expect(authorize.status).toBe(302)
+    expect(consentLocation).toMatch(/^\/settings\/agent-access\?/)
+    const consent = await ctx.app.request('http://localhost:3000/api/auth/oauth2/consent', {
+      method: 'POST',
+      headers: { Cookie: cookie, Origin: 'http://localhost:3000', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        accept: true,
+        oauth_query: consentLocation?.slice(consentLocation.indexOf('?') + 1),
+      }),
+    })
+    const consentBody = (await consent.json()) as { url: string }
+    expect(consent.status).toBe(200)
+    const code = new URL(consentBody.url).searchParams.get('code')
+    expect(code).toBeTruthy()
+
+    const tokenEndpoint = 'http://localhost:3000/api/auth/oauth2/token'
+    const basic = `Basic ${Buffer.from(`${registered.client_id}:${registered.client_secret}`).toString('base64')}`
+    const subjectResponse = await ctx.app.request(tokenEndpoint, {
+      method: 'POST',
+      headers: { Authorization: basic, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code: code!,
+        redirect_uri: redirectUri,
+        code_verifier: verifier,
+        resource: 'http://localhost:3000/api',
+      }).toString(),
+    })
+    const subject = (await subjectResponse.json()) as { access_token: string }
+    expect(subjectResponse.status).toBe(200)
+
+    const now = Math.floor(Date.now() / 1000)
+    const assertion = await new SignJWT({})
+      .setProtectedHeader({ typ: 'JWT', alg: 'ES256', kid: 'agent-key' })
+      .setIssuer('https://broker.example.com/api/auth')
+      .setSubject('agent-123')
+      .setAudience(tokenEndpoint)
+      .setIssuedAt(now)
+      .setExpirationTime(now + 300)
+      .setJti(crypto.randomUUID())
+      .sign(agentPrivateKey)
+    const actorResponse = await ctx.app.request(tokenEndpoint, {
+      method: 'POST',
+      headers: { Authorization: basic, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+        assertion,
+      }).toString(),
+    })
+    const actor = (await actorResponse.json()) as { access_token: string }
+    expect(actorResponse.status, JSON.stringify(actor)).toBe(200)
+
+    const { privateKey: dpopPrivateKey, publicKey: dpopPublicKey } = await generateKeyPair('ES256')
+    const dpopPublicJwk = await exportJWK(dpopPublicKey)
+    const exchangeProof = await new SignJWT({
+      htm: 'POST',
+      htu: tokenEndpoint,
+    })
+      .setProtectedHeader({ typ: 'dpop+jwt', alg: 'ES256', jwk: dpopPublicJwk })
+      .setIssuedAt()
+      .setJti(crypto.randomUUID())
+      .sign(dpopPrivateKey)
+    const exchangeResponse = await ctx.app.request(tokenEndpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: basic,
+        DPoP: exchangeProof,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
+        subject_token: subject.access_token,
+        subject_token_type: 'urn:ietf:params:oauth:token-type:access_token',
+        actor_token: actor.access_token,
+        actor_token_type: 'urn:ietf:params:oauth:token-type:access_token',
+        requested_token_type: 'urn:ietf:params:oauth:token-type:access_token',
+        resource: 'http://localhost:3000/api',
+        scope: 'objects:read quota:read',
+      }).toString(),
+    })
+    const exchanged = (await exchangeResponse.json()) as { access_token: string; token_type: string; scope: string }
+    expect(exchangeResponse.status).toBe(200)
+    expect(exchanged).toMatchObject({ token_type: 'DPoP', scope: 'objects:read quota:read' })
+
+    const apiUrl = 'http://localhost:3000/api/test-agent-audit'
+    const apiProof = await new SignJWT({
+      htm: 'GET',
+      htu: apiUrl,
+      ath: await deriveDpopAth(exchanged.access_token),
+    })
+      .setProtectedHeader({ typ: 'dpop+jwt', alg: 'ES256', jwk: dpopPublicJwk })
+      .setIssuedAt()
+      .setJti(crypto.randomUUID())
+      .sign(dpopPrivateKey)
+    const apiResponse = await ctx.app.request(apiUrl, {
+      headers: { Authorization: `DPoP ${exchanged.access_token}`, DPoP: apiProof },
+    })
+    expect(apiResponse.status).toBe(200)
+    const [auditEvent] = await ctx.db
+      .select()
+      .from(schema.auditEvents)
+      .where(eq(schema.auditEvents.action, 'agent_identity_probe'))
+    expect(auditEvent).toMatchObject({
+      actorType: 'agent_oauth',
+      actorRef: 'agent-123',
+      actorIssuer: 'https://broker.example.com/api/auth',
+    })
+
+    const revokeResponse = await ctx.app.request('http://localhost:3000/api/auth/oauth2/revoke', {
+      method: 'POST',
+      headers: { Authorization: basic, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        token: exchanged.access_token,
+        token_type_hint: 'access_token',
+      }).toString(),
+    })
+    expect(revokeResponse.status).toBe(200)
+
+    const revokedProof = await new SignJWT({
+      htm: 'GET',
+      htu: apiUrl,
+      ath: await deriveDpopAth(exchanged.access_token),
+    })
+      .setProtectedHeader({ typ: 'dpop+jwt', alg: 'ES256', jwk: dpopPublicJwk })
+      .setIssuedAt()
+      .setJti(crypto.randomUUID())
+      .sign(dpopPrivateKey)
+    const revokedResponse = await ctx.app.request(apiUrl, {
+      headers: { Authorization: `DPoP ${exchanged.access_token}`, DPoP: revokedProof },
+    })
+    expect(revokedResponse.status).toBe(401)
+    expect(revokedResponse.headers.get('www-authenticate')).toContain('DPoP')
+  })
+
+  it('issues an authorization code after full consent for a dynamically registered PKCE client', async () => {
+    const ctx = await createTestApp()
+    const previewOrigin = 'https://preview-zpan.example.com'
+    const auth = await createAuth(ctx.platform, 'test-secret', 'https://zpan-staging.example.com', [previewOrigin])
+    const app = createApp(ctx.platform, auth)
+    const signUpResponse = await signUp({ ...ctx, app }, 'agent-oauth-consent@example.com')
+    const cookie = signUpResponse.headers
+      .getSetCookie()
+      .map((value) => value.split(';', 1)[0])
+      .join('; ')
+    const registration = await app.request('/api/auth/oauth2/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_name: 'Consent Test Client',
+        redirect_uris: ['https://broker.example.com/callback'],
+        grant_types: ['authorization_code', 'refresh_token'],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'none',
+        scope: 'openid offline_access objects:read quota:read',
+      }),
+    })
+    const registered = (await registration.json()) as { client_id: string }
+    expect(registration.status).toBe(201)
+    const params = new URLSearchParams({
+      client_id: registered.client_id,
+      redirect_uri: 'https://broker.example.com/callback',
+      response_type: 'code',
+      scope: 'openid offline_access objects:read quota:read',
+      state: 'oauth-consent-test',
+      code_challenge: 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM',
+      code_challenge_method: 'S256',
+    })
+    const authorize = await app.request(`${previewOrigin}/api/auth/oauth2/authorize?${params}`, {
+      headers: { Cookie: cookie, Origin: previewOrigin },
+    })
+    const consentLocation = authorize.headers.get('location')
+    expect(authorize.status).toBe(302)
+    expect(consentLocation).toMatch(/^\/settings\/agent-access\?/)
+
+    const consent = await app.request(`${previewOrigin}/api/auth/oauth2/consent`, {
+      method: 'POST',
+      headers: {
+        Cookie: cookie,
+        Origin: previewOrigin,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        accept: true,
+        oauth_query: consentLocation?.slice(consentLocation.indexOf('?') + 1),
+      }),
+    })
+    const consentBody = await consent.text()
+
+    expect(consent.status, consentBody).toBe(200)
+    expect(JSON.parse(consentBody)).toMatchObject({
+      url: expect.stringMatching(/^https:\/\/broker\.example\.com\/callback\?code=/),
+    })
+  })
+
+  it('blocks partial Agent OAuth consent changes through the Better Auth endpoint', async () => {
+    const ctx = await createTestApp()
+
+    const res = await ctx.app.request('/api/auth/oauth2/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_id: 'dynamic-client', scope: 'objects:read' }),
+    })
+
+    expect(res.status).toBe(400)
+    await expect(res.json()).resolves.toMatchObject({
+      error: 'invalid_request',
+      error_description: 'Partial Agent OAuth consent is not supported',
+    })
   })
 })
 
@@ -470,6 +1257,51 @@ describe('createPersonalOrg — org name and quota edge cases', () => {
     expect(res.status).toBe(200)
   })
 
+  it('team creation uses default_team_quota while personal orgs keep default_org_quota', async () => {
+    const ctx = await createTestApp()
+    await ctx.db.insert(schema.systemOptions).values({ key: 'default_org_quota', value: '1000000' })
+    await ctx.db.insert(schema.systemOptions).values({ key: 'default_team_quota', value: '5000000' })
+
+    const res = await signUp(ctx, 'team-quota@example.com')
+    expect(res.status).toBe(200)
+    const cookies = res.headers.getSetCookie().join('; ')
+
+    const createOrg = await ctx.app.request('/api/auth/organization/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cookies, Origin: 'http://localhost:3000' },
+      body: JSON.stringify({ name: 'My Team', slug: 'my-team', metadata: { type: 'team' } }),
+    })
+    expect(createOrg.status).toBe(200)
+    const org = (await createOrg.json()) as { id: string }
+
+    const rows = await ctx.db.select().from(schema.orgQuotaEntitlements)
+    const teamStorage = rows.find((row) => row.orgId === org.id && row.resourceType === 'storage')
+    expect(teamStorage?.bytes).toBe(5000000)
+    const personalStorage = rows.find((row) => row.orgId !== org.id && row.resourceType === 'storage')
+    expect(personalStorage?.bytes).toBe(1000000)
+  })
+
+  it('team creation falls back to default_org_quota when default_team_quota is unset', async () => {
+    const ctx = await createTestApp()
+    await ctx.db.insert(schema.systemOptions).values({ key: 'default_org_quota', value: '2000000' })
+
+    const res = await signUp(ctx, 'team-quota-fallback@example.com')
+    expect(res.status).toBe(200)
+    const cookies = res.headers.getSetCookie().join('; ')
+
+    const createOrg = await ctx.app.request('/api/auth/organization/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cookies, Origin: 'http://localhost:3000' },
+      body: JSON.stringify({ name: 'Fallback Team', slug: 'fallback-team', metadata: { type: 'team' } }),
+    })
+    expect(createOrg.status).toBe(200)
+    const org = (await createOrg.json()) as { id: string }
+
+    const rows = await ctx.db.select().from(schema.orgQuotaEntitlements)
+    const teamStorage = rows.find((row) => row.orgId === org.id && row.resourceType === 'storage')
+    expect(teamStorage?.bytes).toBe(2000000)
+  })
+
   it('sign-up falls back to DEFAULT_ORG_QUOTA when default_org_quota is non-numeric', async () => {
     const ctx = await createTestApp()
     await ctx.db.insert(schema.systemOptions).values({ key: 'default_org_quota', value: 'not-a-number' })
@@ -506,8 +1338,7 @@ describe('sendInvitationEmail — buildInvitationEmailHtml via invite-member wit
     const signUpRes = await signUp(ctx, email)
     const cookie = signUpRes.headers.getSetCookie().join('; ')
     const body = (await signUpRes.json()) as { user: { id: string } }
-    const orgs = await ctx.db.select().from(authSchema.organization)
-    const orgId = orgs.find((o) => o.slug === `personal-${body.user.id}`)?.id ?? ''
+    const orgId = await personalOrgForUser(ctx, body.user.id)
     return { cookie, orgId }
   }
 
@@ -522,7 +1353,8 @@ describe('sendInvitationEmail — buildInvitationEmailHtml via invite-member wit
 
     const res = await ctx.app.request('/api/auth/organization/invite-member', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      // Cookie-bearing requests must carry an Origin, like real browser requests
+      headers: { 'Content-Type': 'application/json', Cookie: cookie, Origin: 'http://localhost:3000' },
       body: JSON.stringify({ email: 'invitee@example.com', role: 'member', organizationId: orgId }),
     })
     expect(res.status).toBe(200)
@@ -547,7 +1379,7 @@ describe('sendInvitationEmail — buildInvitationEmailHtml via invite-member wit
 
     await ctx.app.request('/api/auth/organization/invite-member', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      headers: { 'Content-Type': 'application/json', Cookie: cookie, Origin: 'http://localhost:3000' },
       body: JSON.stringify({ email: 'newmember@example.com', role: 'member', organizationId: orgId }),
     })
 
@@ -698,5 +1530,35 @@ describe('OAuth username generation — before hook', () => {
       .where(eq(authSchema.user.id, body.user.id))
     // "a_b" sanitizes to "ab" (2 chars) → appends random suffix
     expect(row.username).toMatch(/^ab-[a-z0-9]{6}$/)
+  })
+})
+
+describe('origin check — loopback and LAN origins are trusted without config', () => {
+  // better-auth only enforces the Origin check on requests that carry cookies,
+  // so attach a dummy cookie to make validateOrigin run.
+  async function signInWithOrigin(ctx: TestCtx, origin: string) {
+    return ctx.app.request('/api/auth/sign-in/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: origin, Cookie: 'zp.dummy=1' },
+      body: JSON.stringify({ email: 'origin@example.com', password: 'password123456' }),
+    })
+  }
+
+  it.each([
+    'http://127.0.0.1:3000',
+    'http://192.168.1.50:3000',
+    'http://10.0.0.5:8080',
+  ])('allows sign-in with Origin %s when TRUSTED_ORIGINS is not set', async (origin) => {
+    const ctx = await createTestApp()
+    await signUp(ctx, 'origin@example.com')
+    const res = await signInWithOrigin(ctx, origin)
+    expect(res.status).toBe(200)
+  })
+
+  it('still rejects sign-in from an unknown public origin', async () => {
+    const ctx = await createTestApp()
+    await signUp(ctx, 'origin@example.com')
+    const res = await signInWithOrigin(ctx, 'https://evil.example.com')
+    expect(res.status).toBe(403)
   })
 })

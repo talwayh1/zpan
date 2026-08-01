@@ -4,5 +4,18 @@
 # Required: better-auth signing secret. Generate with: openssl rand -base64 32
 BETTER_AUTH_SECRET=
 
-# Optional: point local development at a non-production ZPan Cloud.
-ZPAN_CLOUD_URL=https://zpan-cloud-staging.saltbo.workers.dev
+# Local ZPan URL.
+BETTER_AUTH_URL=http://localhost:5185
+TRUSTED_ORIGINS=http://localhost:5185
+# Optional comma-separated hosts accepted by the Vite development server.
+# Cloudflare Quick Tunnel (*.trycloudflare.com) is already allowed in development.
+ZPAN_DEV_ALLOWED_HOSTS=
+
+# Local ZPan Cloud URL.
+ZPAN_CLOUD_URL=http://localhost:5186
+
+# Trusted license signing public keys (PASERK k4.public.*, comma-separated).
+# Dev keys are configured here — NOT hardcoded in source — so a leaked dev key is
+# rotated via config and never trusted by production builds. Pair this with the
+# matching LICENSE_SIGNING_KEY in zpan-cloud/.dev.vars (run `npm run gen-keypair`).
+ZPAN_LICENSE_PUBLIC_KEYS=

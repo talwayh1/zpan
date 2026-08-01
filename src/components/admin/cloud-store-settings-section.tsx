@@ -1,38 +1,36 @@
 import { HardDrive } from 'lucide-react'
 import type { UseFormRegisterReturn } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
-import { ProBadge } from '@/components/ProBadge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { Switch } from '@/components/ui/switch'
 
 export type StorageQuotaUnit = 'MB' | 'GB'
 
 export function StorageSettingsSection({
-  hasCloudStore,
   quotaUnit,
-  cloudStoreEnabled,
   quotaError,
   quotaInputProps,
+  teamQuotaUnit,
+  teamQuotaError,
+  teamQuotaInputProps,
   pending,
-  cloudStoreLoading,
   onQuotaUnitChange,
+  onTeamQuotaUnitChange,
   onSave,
-  onCloudStoreChange,
 }: {
-  hasCloudStore: boolean
   quotaUnit: StorageQuotaUnit
-  cloudStoreEnabled: boolean
   quotaError?: string
   quotaInputProps: UseFormRegisterReturn
+  teamQuotaUnit: StorageQuotaUnit
+  teamQuotaError?: string
+  teamQuotaInputProps: UseFormRegisterReturn
   pending: boolean
-  cloudStoreLoading: boolean
   onQuotaUnitChange: (unit: StorageQuotaUnit) => void
+  onTeamQuotaUnitChange: (unit: StorageQuotaUnit) => void
   onSave: () => void
-  onCloudStoreChange: (enabled: boolean) => void
 }) {
   const { t } = useTranslation()
 
@@ -68,24 +66,22 @@ export function StorageSettingsSection({
           {quotaError && <p className="text-xs text-destructive">{quotaError}</p>}
         </div>
 
-        <div
-          className={`flex items-center justify-between gap-4 rounded-md border p-3 ${
-            !hasCloudStore ? 'opacity-60' : ''
-          }`}
-        >
-          <div className="space-y-1">
-            <div className="flex items-center gap-2">
-              <Label htmlFor="cloudStoreEnabled">{t('admin.settings.cloudStoreEnabled')}</Label>
-              <ProBadge tooltip={t('admin.settings.storageProTooltip')} />
-            </div>
-            <p className="text-xs leading-5 text-muted-foreground">{t('admin.settings.cloudStoreEnabledHint')}</p>
+        <div className="space-y-2">
+          <Label htmlFor="teamQuotaValue">{t('admin.settings.defaultTeamQuota')}</Label>
+          <div className="flex items-center gap-2">
+            <Input id="teamQuotaValue" type="number" min={1} step={1} className="flex-1" {...teamQuotaInputProps} />
+            <Select value={teamQuotaUnit} onValueChange={onTeamQuotaUnitChange}>
+              <SelectTrigger className="w-24">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="MB">MB</SelectItem>
+                <SelectItem value="GB">GB</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
-          <Switch
-            id="cloudStoreEnabled"
-            checked={cloudStoreEnabled}
-            disabled={!hasCloudStore || pending || cloudStoreLoading}
-            onCheckedChange={onCloudStoreChange}
-          />
+          <p className="text-xs leading-5 text-muted-foreground">{t('admin.settings.defaultTeamQuotaHint')}</p>
+          {teamQuotaError && <p className="text-xs text-destructive">{teamQuotaError}</p>}
         </div>
 
         <div className="flex justify-end">

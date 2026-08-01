@@ -1,46 +1,124 @@
-import { Hono } from 'hono'
+import { release as osRelease } from 'node:os'
+import { OpenAPIHono } from '@hono/zod-openapi'
+import { Scalar } from '@scalar/hono-api-reference'
+import { AGENT_OAUTH_SCOPE_DESCRIPTIONS, AGENT_OAUTH_SCOPES } from '@shared/agent-oauth'
+import type { Context } from 'hono'
 import { cors } from 'hono/cors'
 import type { Auth } from './auth'
+import { cacheServerTiming, runWithCacheEvents } from './cache/context'
+import { createDeps } from './composition'
+import { isPotentialWebDavPublicRequest, isWebDavPublicRequest } from './domain/webdav-public-url'
+import { adminOverview } from './http/admin-overview'
+import { adminStats } from './http/admin-stats'
+import { agentOAuthGrants } from './http/agent-oauth-grants'
+import { ARAZZO_DOCUMENT_PATH, ARAZZO_MEDIA_TYPE, createArazzoDocument } from './http/arazzo'
+import { serveAvatarBlob } from './http/avatar-blobs'
+import backgroundJobs from './http/background-jobs'
+import { configz } from './http/configz'
+import downloadTasks, { downloaderTasksRoute } from './http/downloads/download-tasks'
+import downloaders, { downloaderSelfRoute } from './http/downloads/downloaders'
+import { events } from './http/events'
+import ihostConfig from './http/image-hosting/config'
+import ihost from './http/image-hosting/images'
+import internal from './http/internal'
+import { notifications } from './http/notifications'
+import { oauthResourceScopes } from './http/oauth-resource-scopes'
+import objects from './http/objects'
+import { adminQuotas, userQuotas } from './http/quotas'
+import redirect from './http/redirect'
+import { authedShares, publicShares } from './http/shares'
+import { announcements } from './http/site/announcements'
+import { adminAudit } from './http/site/audit'
+import { authProviders } from './http/site/auth-providers'
+import { brandingAdmin } from './http/site/branding'
+import emailConfig from './http/site/email-config'
+import imageDomainProvider from './http/site/image-domain-provider'
+import { adminSiteInvitations, publicSiteInvitations } from './http/site/invitations'
+import { adminInviteCodes, publicInviteCodes } from './http/site/invite-codes'
+import { licensing, licensingAdmin } from './http/site/licensing'
+import { siteSettings } from './http/site/settings'
+import storages from './http/site/storages'
+import system from './http/site/system'
+import storageUsage from './http/storage-usage'
+import { cloudStore, cloudStoreWebhooks } from './http/store'
+import { adminTeams, publicTeams, teams } from './http/teams'
+import trash from './http/trash'
+import { users } from './http/users'
+import webdav from './http/webdav'
+import { formatError } from './lib/errors'
+import { auditMiddleware } from './middleware/audit'
 import { authMiddleware } from './middleware/auth'
+import { isHandledError, jsonError } from './middleware/error-handler'
 import { imageHostingDomain } from './middleware/image-hosting-domain'
 import { accessLog } from './middleware/logger'
 import type { Env } from './middleware/platform'
 import { platformMiddleware } from './middleware/platform'
-import { downloaderOpenAPIDocument } from './openapi/downloader'
 import type { Platform } from './platform/interface'
-import { adminAnnouncements, announcements } from './routes/announcements'
-import { adminAudit } from './routes/audit'
-import { adminAuthProviders, publicAuthProviders } from './routes/auth-providers'
-import backgroundJobs from './routes/background-jobs'
-import { brandingAdmin, publicBranding } from './routes/branding'
-import { adminCloudStore, cloudStore, cloudStoreWebhooks } from './routes/cloud-store'
-import downloadTasks from './routes/download-tasks'
-import downloaders, { downloaderSelfRoute } from './routes/downloaders'
-import emailConfig from './routes/email-config'
-import ihost from './routes/ihost'
-import ihostConfig from './routes/ihost-config'
-import { adminInviteCodes, publicInviteCodes } from './routes/invite-codes'
-import licensing from './routes/licensing'
-import licensingAdmin from './routes/licensing-admin'
-import { me } from './routes/me'
-import { notifications } from './routes/notifications'
-import objects from './routes/objects'
-import profile from './routes/profile'
-import { adminQuotas, userQuotas } from './routes/quotas'
-import redirect from './routes/redirect'
-import { authedShares, publicShares } from './routes/shares'
-import { adminSiteInvitations, publicSiteInvitations } from './routes/site-invitations'
-import storages from './routes/storages'
-import system from './routes/system'
-import { publicTeams, teams } from './routes/teams'
-import trash from './routes/trash'
-import users from './routes/users'
-import webdav from './routes/webdav'
+import { getDeployPlatform } from './runtime-platform'
+import type { Deps } from './usecases/deps'
+import { INSTANCE_TELEMETRY_CRON, reportInstanceTelemetry } from './usecases/site/instance-telemetry'
+import { ensureSitePublicOrigin } from './usecases/site/public-origin'
+import { getSiteRoutingConfig } from './usecases/site/routing-config'
 
-export function createApp(platform: Platform, auth: Auth) {
-  const app = new Hono<Env>()
+export function createApp(platform: Platform, auth: Auth, deps: Deps = createDeps(platform)) {
+  const app = new OpenAPIHono<Env>()
+  const corsOrigins = getCorsOrigins(platform)
 
   app.use('/*', platformMiddleware(platform, auth))
+  app.use('/*', async (c, next) => {
+    // An SSE connection outlives the response setup by minutes. Keeping request
+    // diagnostics attached would retain its AsyncLocalStorage store for the
+    // whole stream even though the polling loop does not use the cache.
+    if (c.req.path === '/api/events' || c.req.path === '/api/events/') {
+      await next()
+      return
+    }
+    await runWithCacheEvents(async () => {
+      await next()
+      const serverTiming = cacheServerTiming()
+      if (serverTiming) c.res.headers.append('Server-Timing', serverTiming)
+    })
+  })
+  app.use('/*', async (c, next) => {
+    c.set('deps', deps)
+    await next()
+  })
+  app.use('/*', async (c, next) => {
+    if (isPotentialWebDavPublicRequest(c.req.url)) {
+      const routing = await getSiteRoutingConfig(deps)
+      c.set('webDavEnabled', routing.webDavEnabled)
+      c.set('webDavDomain', routing.webDavDomain)
+      const routingOrigin = routing.publicOrigin ?? (routing.webDavDomain ? new URL(c.req.url).origin : null)
+      if (routing.webDavEnabled && isWebDavPublicRequest(c.req.url, routingOrigin, routing.webDavDomain)) {
+        c.set('sitePublicOrigin', routingOrigin)
+        c.set('webDavMountPath', '')
+        await next()
+        return
+      }
+    }
+    const result = await ensureSitePublicOrigin(deps, c.req.url).catch((err) => {
+      console.error(`site.public_origin.detect.error code=${formatError(err)}`)
+      return { origin: null, created: false }
+    })
+    c.set('sitePublicOrigin', result.origin)
+
+    if (result.created && result.origin && shouldReportInitialTelemetry(c.req.url)) {
+      const task = reportInstanceTelemetry(deps, {
+        config: {
+          siteUrl: result.origin,
+          allowIp: envAllowsIp(platform.getEnv('ZPAN_TELEMETRY_ALLOW_IP')),
+        },
+        cron: INSTANCE_TELEMETRY_CRON,
+        trigger: 'runtime',
+        runtime: instanceTelemetryRuntime(platform),
+      }).catch((err) => {
+        console.error(`instance.telemetry.initial_report.error code=${formatError(err)}`)
+      })
+      waitUntil(c, task)
+    }
+
+    await next()
+  })
   app.use('/*', imageHostingDomain)
   app.use('/api/*', accessLog)
   app.use('/dav', accessLog)
@@ -49,75 +127,342 @@ export function createApp(platform: Platform, auth: Auth) {
   app.use(
     '/api/*',
     cors({
-      origin: (origin) => origin || '*',
+      origin: (origin) => (origin && corsOrigins.has(origin) ? origin : null),
       allowHeaders: ['Content-Type', 'Authorization'],
       allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
       credentials: true,
     }),
   )
 
-  app.on(['POST', 'GET'], '/api/auth/*', async (c) => {
+  app.on(['POST', 'GET', 'HEAD'], '/api/auth/*', async (c) => {
     const a = c.get('auth')
-    return a.handler(c.req.raw)
+    const revokeRequest = c.req.path === '/api/auth/oauth2/revoke' ? c.req.raw.clone() : null
+    const response = await a.handler(c.req.raw)
+    if (revokeRequest && response.status === 400) {
+      const error = (await response
+        .clone()
+        .json()
+        .catch(() => null)) as { error?: string } | null
+      if (error?.error === 'unsupported_token_type') {
+        const token = (await revokeRequest.formData()).get('token')
+        if (typeof token === 'string') {
+          await c.get('deps').agentOAuth.revokeJwtAccessToken(c.get('platform').db, token)
+          return new Response(null, {
+            status: 200,
+            headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' },
+          })
+        }
+      }
+    }
+    return response
   })
 
-  app.get('/api/openapi/downloader.json', (c) => c.json(downloaderOpenAPIDocument()))
+  app.on(['GET', 'HEAD'], '/.well-known/oauth-authorization-server/api/auth', async (c) => {
+    return c.get('auth').handler(c.req.raw)
+  })
 
-  app.all('/dav', (c) => c.redirect('/dav/', 308))
+  app.on(['GET', 'HEAD'], '/.well-known/openid-configuration/api/auth', async (c) => {
+    return c.get('auth').handler(c.req.raw)
+  })
+
+  app.on(['GET', 'HEAD'], '/.well-known/oauth-protected-resource/api', async (c) => {
+    const origin = new URL(c.req.url).origin
+    const authorizationServer = (await c.get('auth').$context).baseURL
+    return c.json({
+      resource: `${origin}/api`,
+      authorization_servers: [authorizationServer],
+      bearer_methods_supported: ['header'],
+      scopes_supported: AGENT_OAUTH_SCOPES.filter((scope) => scope.includes(':')),
+      dpop_signing_alg_values_supported: ['ES256', 'EdDSA'],
+      resource_name: 'ZPan API',
+    })
+  })
+
+  app.get('/api', (c) => {
+    c.header(
+      'Link',
+      [
+        '</api/openapi.json>; rel="service-desc"; type="application/openapi+json"',
+        `<${ARAZZO_DOCUMENT_PATH}>; rel="describedby"; type="application/vnd.oai.workflows+json"`,
+      ].join(', '),
+    )
+    return c.json({ name: 'ZPan API', openapi: '/api/openapi.json', workflows: ARAZZO_DOCUMENT_PATH })
+  })
+
+  app.on(['GET', 'HEAD'], ARAZZO_DOCUMENT_PATH, (c) => {
+    const headers = {
+      'Cache-Control': 'public, max-age=300',
+      'Content-Type': ARAZZO_MEDIA_TYPE,
+    }
+    if (c.req.method === 'HEAD') return c.newResponse(null, 200, headers)
+    return c.newResponse(JSON.stringify(createArazzoDocument(new URL(c.req.url).origin)), 200, headers)
+  })
+
+  // Global OpenAPI document. Aggregates every route defined with `.openapi()`
+  // across all mounted sub-apps — a route appears here as soon as its resource is
+  // converted to OpenAPIHono, no curation needed. better-auth endpoints (incl. the
+  // device flow) document themselves separately at /api/auth/reference.
+  app.get('/api/openapi.json', async (c) => {
+    const doc = app.getOpenAPIDocument({
+      openapi: '3.1.0',
+      info: { title: 'ZPan API', version: '0.1.0' },
+      servers: [{ url: '/', description: 'Current ZPan origin' }],
+      externalDocs: {
+        description: 'Machine-readable API workflows (Arazzo 1.1)',
+        url: ARAZZO_DOCUMENT_PATH,
+      },
+      // Top-level tag order + descriptions; Scalar groups operations by these.
+      tags: [
+        { name: 'Objects', description: 'Files and folders, including S3 multipart upload sessions' },
+        { name: 'Events', description: 'Multiplexed server-sent event stream' },
+        { name: 'Download Tasks', description: 'Remote download tasks' },
+        { name: 'Downloaders', description: 'Download agents and their heartbeats' },
+      ],
+    })
+
+    // Merge better-auth's own auto-generated schema (sign-in/up, organization,
+    // the device-authorization flow, …) into the same document. Both halves are
+    // generated — nothing here is a hand-maintained endpoint definition; new
+    // better-auth endpoints appear automatically. Its paths are relative to the
+    // /api/auth mount, so prefix them.
+    const authDoc = (await c.get('auth').api.generateOpenAPISchema()) as {
+      paths?: Record<string, unknown>
+      components?: { schemas?: Record<string, unknown> }
+    }
+    for (const [path, item] of Object.entries(authDoc.paths ?? {})) {
+      doc.paths[`/api/auth${path}`] = item as (typeof doc.paths)[string]
+    }
+    doc.components ??= {}
+    doc.components.securitySchemes = {
+      ...(doc.components.securitySchemes ?? {}),
+      cookieAuth: { type: 'apiKey', in: 'cookie', name: 'zp.session_token' },
+      bearerAuth: { type: 'http', scheme: 'bearer' },
+      agentOAuth2: {
+        type: 'oauth2',
+        flows: {
+          authorizationCode: {
+            authorizationUrl: '/api/auth/oauth2/authorize',
+            tokenUrl: '/api/auth/oauth2/token',
+            refreshUrl: '/api/auth/oauth2/token',
+            scopes: {
+              ...agentScopeDescriptions(),
+            },
+          },
+        },
+      },
+    }
+    doc.components.schemas = {
+      ...(authDoc.components?.schemas as typeof doc.components.schemas),
+      ...doc.components.schemas,
+    }
+    Object.assign(doc, {
+      'x-zpan-discovery': {
+        oauthAuthorizationServer: '/.well-known/oauth-authorization-server/api/auth',
+        oauthProtectedResource: '/.well-known/oauth-protected-resource/api',
+      },
+    })
+
+    // better-auth's device-authorization plugin advertises POST /device/token as
+    // returning { session, user }, but its handler actually returns the OAuth
+    // device token { access_token, token_type, expires_in } (see better-auth's
+    // device-authorization/routes.mjs). Correct that one wrong response so the
+    // document — and the generated downloader client — match the real wire shape.
+    const deviceTokenJson = (
+      doc.paths['/api/auth/device/token'] as
+        | { post?: { responses?: Record<string, { content?: Record<string, { schema?: unknown }> }> } }
+        | undefined
+    )?.post?.responses?.['200']?.content?.['application/json']
+    if (deviceTokenJson) {
+      deviceTokenJson.schema = {
+        type: 'object',
+        properties: {
+          access_token: { type: 'string' },
+          token_type: { type: 'string' },
+          expires_in: { type: 'integer' },
+          scope: { type: 'string' },
+        },
+        required: ['access_token', 'token_type', 'expires_in'],
+      }
+    }
+
+    for (const [path, pathItem] of Object.entries(doc.paths)) {
+      if (!path.startsWith('/api/auth/') || !pathItem || typeof pathItem !== 'object') continue
+      for (const operation of Object.values(pathItem)) {
+        if (!operation || typeof operation !== 'object') continue
+        Object.assign(operation, {
+          'x-zpan-auth': { public: true, scopes: [] },
+          'x-mcp-ignore': true,
+        })
+        if (path.includes('/callback')) Object.assign(operation, { 'x-cli-ignore': true })
+      }
+    }
+
+    return c.json(doc)
+  })
+
+  // Scalar interactive API reference for the global document above. Our own
+  // resources live here; better-auth serves its own reference at /api/auth/reference.
+  app.get('/api/docs', Scalar({ url: '/api/openapi.json', title: 'ZPan API' }))
+
   app.route('/dav', webdav)
 
-  // Public routes — no auth required; mount before authMiddleware.
+  // Resolve the caller's principal for API routes that can use it. Public,
+  // identity-independent health/config responses skip session resolution so
+  // their hot path does not touch auth tables.
+  const skipsPrincipalResolution = (path: string) =>
+    path === '/api/configz' || path === '/api/configz/' || path === '/api/health'
+
+  // authMiddleware is soft-fail: it resolves the protocol-specific credential
+  // into a principal and protocol-neutral authorization context. Each authRoute
+  // declaration then performs the runtime authorization, so one router can mix
+  // public and protected endpoints without a second guard mapping.
+  app.use('/api/*', async (c, next) => {
+    if (skipsPrincipalResolution(c.req.path)) {
+      await next()
+      return
+    }
+    await authMiddleware(c, next)
+  })
+  app.use('/api/*', async (c, next) => {
+    if (skipsPrincipalResolution(c.req.path)) {
+      await next()
+      return
+    }
+    await auditMiddleware(c, next)
+  })
+
+  // Public routes — no per-route auth guard.
   // /api/shares/:token endpoints are covered by run_worker_first=["/api/*"] in wrangler.toml.
   // /r/* is listed separately in run_worker_first.
   // /s/:token is intentionally left for the SPA landing page.
   app.route('/api/shares', publicShares)
+  app.route('/api/configz', configz)
+  app.route('/api/oauth-resource-scopes', oauthResourceScopes)
+  // Self-hosted avatar blobs (CF + AVATARS R2 binding, no AVATARS_PUBLIC_URL). Public.
+  app.get('/api/avatar-blobs/:scope/:id', serveAvatarBlob)
   app.route('/r', redirect)
-  app.route('/api/profiles', profile)
   app.route('/api/teams', publicTeams)
-  app.route('/api/auth-providers', publicAuthProviders)
-  app.route('/api/licensing', licensing)
-  app.route('/api/branding', publicBranding)
-  app.route('/api/site-invitations', publicSiteInvitations)
+  app.route('/api/site/invitations', publicSiteInvitations)
   app.route('/api/store', cloudStoreWebhooks)
+  app.route('/api/internal', internal)
 
-  app.use('/api/*', authMiddleware)
-
-  app.route('/api/me', me)
-  app.route('/api/announcements', announcements)
+  app.route('/api/users', users)
+  app.route('/api/site/announcements', announcements)
+  app.route('/api/site/licensing', licensing)
 
   // Mount routes separately to avoid deep type chain accumulation.
   // Each .route() call is independent — TypeScript doesn't stack types.
+  // Authorization comes from each authRoute declaration, so a single resource
+  // path can serve public, user, and admin callers.
   app.route('/api/objects', objects)
   app.route('/api/shares', authedShares)
   app.route('/api/trash', trash)
+  app.route('/api', agentOAuthGrants)
   app.route('/api/teams', teams)
-  app.route('/api/admin/storages', storages)
-  app.route('/api/admin/users', users)
-  app.route('/api/admin/email-config', emailConfig)
-  app.route('/api/admin/invite-codes', adminInviteCodes)
-  app.route('/api/invite-codes', publicInviteCodes)
-  app.route('/api/admin/site-invitations', adminSiteInvitations)
-  app.route('/api/admin/quotas', adminQuotas)
+  app.route('/api/teams', adminTeams)
+  app.route('/api/site/storages', storages)
+  app.route('/api/site/settings', siteSettings)
+  app.route('/api/site/settings/email', emailConfig)
+  app.route('/api/site/settings/image-domains', imageDomainProvider)
+  app.route('/api/site/auth-providers', authProviders)
+  // Public/user routes mount before admin routes on this shared path to preserve
+  // route matching order.
+  app.route('/api/site/invite-codes', publicInviteCodes)
+  app.route('/api/site/invite-codes', adminInviteCodes)
+  app.route('/api/site/invitations', adminSiteInvitations)
   app.route('/api/quotas', userQuotas)
+  app.route('/api/quotas', adminQuotas)
+  app.route('/api/storage', storageUsage)
   app.route('/api/store', cloudStore)
-  app.route('/api/admin/store', adminCloudStore)
-  app.route('/api/system', system)
-  app.route('/api/admin/auth-providers', adminAuthProviders)
+  app.route('/api/site', system)
   app.route('/api/notifications', notifications)
   app.route('/api/background-jobs', backgroundJobs)
-  app.route('/api/download-tasks', downloadTasks)
-  app.route('/api/downloader', downloaderSelfRoute)
-  app.route('/api/ihost', ihost)
-  app.route('/api/ihost/config', ihostConfig)
-  app.route('/api/licensing', licensingAdmin)
-  app.route('/api/admin/branding', brandingAdmin)
-  app.route('/api/admin/announcements', adminAnnouncements)
-  app.route('/api/admin/audit', adminAudit)
-  app.route('/api/admin/downloaders', downloaders)
+  app.route('/api/downloads/tasks', downloadTasks)
+  app.route('/api/events', events)
+  app.route('/api/downloads/downloaders', downloaderSelfRoute)
+  app.route('/api/downloads/downloaders', downloaderTasksRoute)
+  app.route('/api/image-hosting', ihost)
+  app.route('/api/image-hosting/config', ihostConfig)
+  app.route('/api/site/licensing', licensingAdmin)
+  app.route('/api/site/settings/branding', brandingAdmin)
+  app.route('/api/site/audit-events', adminAudit)
+  app.route('/api/site/analytics', adminOverview)
+  app.route('/api/site/analytics', adminStats)
+  app.route('/api/downloads/downloaders', downloaders)
 
   app.get('/api/health', (c) => c.json({ status: 'ok' }))
 
+  // Backstop for errors thrown outside the accessLog boundary (earlier middleware,
+  // or routes without accessLog like /r). For /api and /dav, accessLog already
+  // catches and renders via the same `jsonError`, so this rarely fires there.
+  // Genuinely unhandled errors are logged here since those routes aren't access-
+  // logged; AppError/mapped cases are already carried by their access-log line.
+  app.onError((err, c) => {
+    if (!isHandledError(err)) console.error(`http.unhandled_error code=${formatError(err)}`)
+    return jsonError(c, err)
+  })
+
   return app
+}
+
+function envAllowsIp(value: string | undefined): boolean {
+  return !['0', 'false', 'no', 'off'].includes(value?.trim().toLowerCase() ?? '')
+}
+
+function instanceTelemetryRuntime(platform: Platform) {
+  if (platform.getBinding('DB')) {
+    return {
+      runtime: 'workerd' as const,
+      platform: 'cloudflare-workers' as const,
+    }
+  }
+
+  return {
+    runtime: 'node' as const,
+    platform: getDeployPlatform() ?? 'node',
+    osPlatform: process.platform,
+    osArch: process.arch,
+    osRelease: osRelease(),
+    nodeVersion: process.version,
+  }
+}
+
+function waitUntil(c: Context, task: Promise<unknown>): void {
+  try {
+    c.executionCtx.waitUntil(task)
+    return
+  } catch {
+    void task
+  }
+}
+
+function shouldReportInitialTelemetry(requestUrl: string): boolean {
+  const url = new URL(requestUrl)
+  if (url.pathname === '/api/internal/instance-telemetry/report') return false
+  return !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
+}
+
+function getCorsOrigins(platform: Platform): Set<string> {
+  const origins = new Set<string>()
+  const addOrigin = (value: string | undefined) => {
+    if (!value) return
+    try {
+      origins.add(new URL(value).origin)
+    } catch {
+      origins.add(value)
+    }
+  }
+
+  addOrigin(platform.getEnv('BETTER_AUTH_URL'))
+  for (const origin of platform.getEnv('TRUSTED_ORIGINS')?.split(',') ?? []) {
+    addOrigin(origin.trim())
+  }
+
+  return origins
+}
+
+function agentScopeDescriptions(): Record<string, string> {
+  return { ...AGENT_OAUTH_SCOPE_DESCRIPTIONS }
 }
 
 export type AppType = ReturnType<typeof createApp>
@@ -130,33 +475,38 @@ export type TrashRoute = typeof trash
 export type StoragesRoute = typeof storages
 export type UsersRoute = typeof users
 export type AdminQuotasRoute = typeof adminQuotas
+export type AdminTeamsRoute = typeof adminTeams
 export type UserQuotasRoute = typeof userQuotas
 export type SystemRoute = typeof system
+export type ConfigzRoute = typeof configz
+export type SiteSettingsRoute = typeof siteSettings
 export type EmailConfigRoute = typeof emailConfig
+export type ImageDomainProviderRoute = typeof imageDomainProvider
 export type AdminInviteCodesRoute = typeof adminInviteCodes
 export type PublicInviteCodesRoute = typeof publicInviteCodes
 export type AdminSiteInvitationsRoute = typeof adminSiteInvitations
 export type PublicSiteInvitationsRoute = typeof publicSiteInvitations
-export type AuthProvidersRoute = typeof publicAuthProviders
-export type AdminAuthProvidersRoute = typeof adminAuthProviders
-export type ProfileRoute = typeof profile
+export type AuthProvidersRoute = typeof authProviders
 export type CloudStoreRoute = typeof cloudStore
 export type CloudStoreWebhooksRoute = typeof cloudStoreWebhooks
-export type AdminCloudStoreRoute = typeof adminCloudStore
 export type TeamsRoute = typeof teams
 export type PublicTeamsRoute = typeof publicTeams
 export type NotificationsRoute = typeof notifications
 export type BackgroundJobsRoute = typeof backgroundJobs
 export type DownloadTasksRoute = typeof downloadTasks
+export type EventsRoute = typeof events
 export type DownloadersRoute = typeof downloaders
 export type DownloaderSelfRoute = typeof downloaderSelfRoute
+export type DownloaderTasksRoute = typeof downloaderTasksRoute
 export type IhostRoute = typeof ihost
 export type IhostConfigRoute = typeof ihostConfig
-export type MeRoute = typeof me
 export type AnnouncementsRoute = typeof announcements
-export type AdminAnnouncementsRoute = typeof adminAnnouncements
 export type LicensingRoute = typeof licensing
 export type LicensingAdminRoute = typeof licensingAdmin
-export type PublicBrandingRoute = typeof publicBranding
 export type BrandingAdminRoute = typeof brandingAdmin
 export type AdminAuditRoute = typeof adminAudit
+export type AdminOverviewRoute = typeof adminOverview
+export type AdminStatsRoute = typeof adminStats
+export type StorageUsageRoute = typeof storageUsage
+export type AgentOAuthGrantsRoute = typeof agentOAuthGrants
+export type OAuthResourceScopesRoute = typeof oauthResourceScopes
