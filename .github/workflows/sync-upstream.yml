@@ -25,13 +25,13 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git remote add upstream https://github.com/saltbo/zpan.git 2>/dev/null || true
-          git fetch upstream master
+          git fetch upstream main
 
           # Try merge
-          if git merge upstream/master --no-edit -m "chore: sync upstream"; then
+          if git merge upstream/main --no-edit -m "chore: sync upstream"; then
             echo "SYNCED=true" >> "$GITHUB_ENV"
-            COUNT=$(git rev-list --count HEAD ^upstream/master || echo 0)
-            echo "Merged upstream/master successfully"
+            COUNT=$(git rev-list --count HEAD ^upstream/main || echo 0)
+            echo "Merged upstream/main successfully"
           else
             echo "CONFLICT=true" >> "$GITHUB_ENV"
             echo "Merge conflict detected"
@@ -52,11 +52,11 @@ jobs:
               repo: context.repo.repo,
               title: '🔀 Upstream merge conflict — manual sync needed',
               body: [
-                'Upstream `saltbo/zpan:master` has changes that conflict with our fork.',
+                'Upstream `saltbo/zpan:main` has changes that conflict with our fork.',
                 '',
                 '```bash',
-                'git fetch upstream master',
-                'git merge upstream/master',
+                'git fetch upstream main',
+                'git merge upstream/main',
                 '# resolve conflicts, then:',
                 'git push origin master',
                 '```',
