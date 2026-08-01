@@ -5,6 +5,11 @@ name: Deploy to Cloudflare Workers
 # supported.
 on:
   workflow_call:
+    inputs:
+      version:
+        description: 'Release tag to deploy (e.g. v2.1.0). Leave empty for latest.'
+        required: false
+        type: string
   workflow_dispatch:
     inputs:
       version:
