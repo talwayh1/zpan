@@ -14,10 +14,6 @@ database_name = "zpan-db"
 database_id = "fba68591-889a-49ab-9af0-543a30a19e5e"
 migrations_dir = "./migrations"
 
-[[kv_namespaces]]
-binding = "CACHE_KV"
-id = "2721f9d7b47d433d8a0e02171e276f57"
-
 [[ratelimits]]
 name = "WEBDAV_RATE_LIMITER"
 namespace_id = "2801"
@@ -77,10 +73,6 @@ binding = "DB"
 database_name = "zpan-db-staging"
 database_id = "fba68591-889a-49ab-9af0-543a30a19e5e"
 migrations_dir = "./migrations"
-
-[[env.staging.kv_namespaces]]
-binding = "CACHE_KV"
-id = "7d8625bacbc54e23a46ca4464a9f64a0"
 
 [[env.staging.ratelimits]]
 name = "WEBDAV_RATE_LIMITER"
